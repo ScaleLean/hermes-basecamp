@@ -212,6 +212,65 @@ class AdapterRuntimeTests(unittest.IsolatedAsyncioTestCase):
             state = json.loads(adapter._replay.path.read_text())
             self.assertIn("9", state["committed"])
 
+    async def test_assignment_dispatch_uses_canonical_creator(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            canonical = {
+                "id": 49,
+                "type": "Todo",
+                "title": "Test the integration",
+                "creator": {"id": 8, "name": "Member", "client": False},
+                "assignees": [{"id": 7}],
+                "bucket": {"id": 10},
+            }
+            client = SimpleNamespace(
+                project_ids=("10",),
+                expected=SimpleNamespace(account_id="1", person_id="7"),
+                fetch_recording=AsyncMock(return_value=canonical),
+                call=AsyncMock(return_value={"id": 49, "completed": True, "bucket": {"id": 10}}),
+            )
+            config = PlatformConfig(
+                extra={
+                    "account_id": "1",
+                    "person_id": "7",
+                    "person_email": "agent@example.com",
+                    "mention": "@agent",
+                    "project_ids": ["10"],
+                    "access_token": "test",
+                }
+            )
+            with (
+                patch("adapter._make_client", return_value=client),
+                patch("adapter.default_replay_path", return_value=root / "replay.json"),
+                patch("adapter.configured_media_roots", return_value=(root,)),
+                patch("adapter.configured_inbound_media_root", return_value=root),
+                patch("adapter.Platform", return_value=next(iter(Platform))),
+            ):
+                adapter = BasecampAdapter(config)
+            adapter._bootstrapped = True
+            adapter._poller.collect = AsyncMock(
+                return_value=[
+                    {
+                        "id": "assignment:49",
+                        "kind": "assignment_created",
+                        "creator": {"id": "basecamp", "name": "Basecamp"},
+                        "bucket": {"id": 10},
+                        "recording": {"id": 49, "type": "Todo", "assignees": [{"id": 7}]},
+                    }
+                ]
+            )
+            seen_user_ids = []
+
+            async def handle(event):
+                seen_user_ids.append(event.user_id)
+                await adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
+
+            adapter.handle_message = AsyncMock(side_effect=handle)
+
+            await adapter._poll_once()
+
+            self.assertEqual(seen_user_ids, ["8"])
+
     async def test_native_media_send_uses_attachment_markup_and_verified_target(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

@@ -385,9 +385,13 @@ class BasecampAdapter(BasePlatformAdapter):
                     continue
                 verified_raw = dict(pointer.raw)
                 verified_raw["recording"] = canonical
+                canonical_creator = canonical.get("creator") or {}
+                if isinstance(canonical_creator, Mapping) and canonical_creator.get("id"):
+                    verified_raw["creator"] = canonical_creator
                 verified = normalize_event(verified_raw)
                 if (
                     not verified
+                    or verified.person_id == self._client.expected.person_id
                     or (not is_ping and verified.project_id not in self._client.project_ids)
                     or not (
                         is_addressed_to(verified_raw, person_id=self._client.expected.person_id, mention=self._mention)
