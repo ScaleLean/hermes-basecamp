@@ -221,6 +221,36 @@ class SDKIdentityTests(unittest.IsolatedAsyncioTestCase):
             await client.post_chat("10", "30", "denied")
         campfires.create_line.assert_not_awaited()
 
+    async def test_ping_write_requires_matching_authenticated_circle(self):
+        client = object.__new__(BasecampSDKClient)
+        client.project_ids = ("10",)
+        client.resolve_ping_transcript = AsyncMock(return_value="66")
+        campfires = SimpleNamespace(
+            get=AsyncMock(),
+            create_line=AsyncMock(return_value={"id": 90}),
+        )
+        client._account = SimpleNamespace(campfires=campfires)
+
+        result = await client.post_chat("55", "66", "hello")
+
+        self.assertEqual(result["id"], 90)
+        client.resolve_ping_transcript.assert_awaited_once_with("55")
+        campfires.get.assert_not_awaited()
+        campfires.create_line.assert_awaited_once_with(
+            campfire_id=66, content="hello", content_type="text/html"
+        )
+
+    async def test_ping_write_rejects_mismatched_transcript(self):
+        client = object.__new__(BasecampSDKClient)
+        client.project_ids = ("10",)
+        client.resolve_ping_transcript = AsyncMock(return_value="77")
+        campfires = SimpleNamespace(create_line=AsyncMock())
+        client._account = SimpleNamespace(campfires=campfires)
+
+        with self.assertRaises(OwnershipMismatchError):
+            await client.post_chat("55", "66", "denied")
+        campfires.create_line.assert_not_awaited()
+
     async def test_recording_target_project_mismatch_never_mutates(self):
         client = object.__new__(BasecampSDKClient)
         client.project_ids = ("10",)

@@ -539,14 +539,16 @@ class BasecampSDKClient:
         }
 
     async def post_chat(self, project_id: str, room_id: str, content: str) -> Mapping[str, Any]:
-        room = await self._account.campfires.get(campfire_id=int(room_id))
-        bucket = room.get("bucket") or {}
-        actual_id = str(bucket.get("id") or "") if isinstance(bucket, Mapping) else ""
-        bucket_type = str(bucket.get("type") or "") if isinstance(bucket, Mapping) else ""
-        if actual_id != project_id:
-            raise OwnershipMismatchError("Basecamp chat belongs to a different bucket")
-        if bucket_type != "Circle" and project_id not in self.project_ids:
-            raise OwnershipMismatchError("Basecamp Campfire project is not allowlisted")
+        if project_id in self.project_ids:
+            room = await self._account.campfires.get(campfire_id=int(room_id))
+            bucket = room.get("bucket") or {}
+            actual_id = str(bucket.get("id") or "") if isinstance(bucket, Mapping) else ""
+            if actual_id != project_id:
+                raise OwnershipMismatchError("Basecamp chat belongs to a different bucket")
+        else:
+            transcript_id = await self.resolve_ping_transcript(project_id)
+            if transcript_id != room_id:
+                raise OwnershipMismatchError("Basecamp Ping transcript belongs to a different Circle")
         return await self._account.campfires.create_line(
             campfire_id=int(room_id), content=content, content_type="text/html"
         )
