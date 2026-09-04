@@ -101,6 +101,7 @@ def _settings(config: PlatformConfig | None = None) -> dict[str, Any]:
         "client_secret": str(configured("client_secret", "BASECAMP_CLIENT_SECRET")),
         "expires_at": expires,
         "chat_poll_seconds": int(configured("chat_poll_seconds", "BASECAMP_POLL_CHAT_SECONDS", "15")),
+        "ping_poll_seconds": int(configured("ping_poll_seconds", "BASECAMP_POLL_PING_SECONDS", "10")),
         "notification_poll_seconds": int(configured("notification_poll_seconds", "BASECAMP_POLL_NOTIFY_SECONDS", "45")),
         "assignment_poll_seconds": int(configured("assignment_poll_seconds", "BASECAMP_POLL_ASSIGNMENT_SECONDS", "30")),
         "reconciliation_seconds": int(configured("reconciliation_seconds", "BASECAMP_RECONCILE_SECONDS", "300")),
@@ -211,6 +212,7 @@ class BasecampAdapter(BasePlatformAdapter):
         self._poller = CompositePoller(
             self._client,
             chat_seconds=values["chat_poll_seconds"],
+            ping_seconds=values["ping_poll_seconds"],
             notification_seconds=values["notification_poll_seconds"],
             assignment_seconds=values["assignment_poll_seconds"],
             reconciliation_seconds=values["reconciliation_seconds"],
@@ -347,7 +349,7 @@ class BasecampAdapter(BasePlatformAdapter):
             self._health.connected = state in {"ready", "recovering"}
 
     def _receive_lanes_ready(self) -> bool:
-        required = {"campfire_discovery", "chat", "notifications", "assignments", "reconciliation"}
+        required = {"campfire_discovery", "chat", "pings", "notifications", "assignments", "reconciliation"}
         return (
             required.issubset(getattr(self._health, "lane_last_success", {}))
             and self._inbox.stats().get("poison", 0) == 0
@@ -951,6 +953,7 @@ def _apply_yaml_config(_yaml_cfg: dict, basecamp_cfg: dict) -> dict[str, Any] | 
         "token_path": "token_file",
         "token_file": "token_file",
         "poll_chat_seconds": "chat_poll_seconds",
+        "poll_ping_seconds": "ping_poll_seconds",
         "poll_notify_seconds": "notification_poll_seconds",
         "poll_assignment_seconds": "assignment_poll_seconds",
         "reconcile_seconds": "reconciliation_seconds",

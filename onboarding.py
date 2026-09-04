@@ -87,12 +87,13 @@ async def probe_runtime(client: Any, inbox: Any) -> dict[str, Any]:
                     )
                 )
     await asyncio.gather(
+        run("pings", client.pings()),
         run("notifications", client.notifications()),
         run("assignments", client.assignments()),
         run("activity", client.timeline(limit_per_project=1)),
         *chat_operations,
     )
-    required = {"campfire_discovery", "notifications", "assignments", "activity"}
+    required = {"campfire_discovery", "pings", "notifications", "assignments", "activity"}
     lane_ok = all(lanes.get(name, {}).get("ok") is True for name in required)
     webhook_state = "unconfigured"
     public_url = os.getenv("BASECAMP_WEBHOOK_PUBLIC_URL", "").strip()

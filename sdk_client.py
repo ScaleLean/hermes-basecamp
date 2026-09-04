@@ -280,6 +280,12 @@ class BasecampSDKClient:
         return events
 
     async def notifications(self) -> list[Mapping[str, Any]]:
+        return await self._notification_events(pings_only=False)
+
+    async def pings(self) -> list[Mapping[str, Any]]:
+        return await self._notification_events(pings_only=True)
+
+    async def _notification_events(self, *, pings_only: bool) -> list[Mapping[str, Any]]:
         payload = await self._account.my_notifications.get_my_notifications(limit_bubble_ups=True)
         events: list[Mapping[str, Any]] = []
         for key in ("unreads", "reads", "bubble_ups", "scheduled_bubble_ups"):
@@ -294,6 +300,8 @@ class BasecampSDKClient:
                     )
                     section = str(item.get("section") or "").lower()
                     if section == "pings":
+                        if not pings_only:
+                            continue
                         if location is None:
                             continue
                         bucket_id = location.group("bucket")
@@ -320,6 +328,8 @@ class BasecampSDKClient:
                                     "_stream_id": f"ping:{bucket_id}",
                                 }
                             )
+                        continue
+                    if pings_only:
                         continue
                     resolved = _notification_recording(item)
                     if resolved is None:

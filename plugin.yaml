@@ -79,6 +79,10 @@ optional_env:
     description: "Campfire polling interval, minimum 10 seconds"
     prompt: "Basecamp chat poll interval"
     password: false
+  - name: BASECAMP_POLL_PING_SECONDS
+    description: "Ping polling interval, minimum 10 seconds"
+    prompt: "Basecamp Ping poll interval"
+    password: false
   - name: BASECAMP_POLL_NOTIFY_SECONDS
     description: "Notification polling interval, minimum 15 seconds"
     prompt: "Basecamp notification poll interval"

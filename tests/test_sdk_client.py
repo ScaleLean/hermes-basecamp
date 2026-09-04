@@ -39,7 +39,7 @@ class SDKIdentityTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(await client.resolve_target("30", "10"), ("chat", "10"))
 
-    async def test_notifications_expand_ping_to_canonical_circle_lines(self):
+    async def test_pings_expand_to_canonical_circle_lines(self):
         client = object.__new__(BasecampSDKClient)
         client.project_ids = ("10",)
         readings = {
@@ -55,7 +55,7 @@ class SDKIdentityTests(unittest.IsolatedAsyncioTestCase):
             my_notifications=SimpleNamespace(get_my_notifications=AsyncMock(return_value=readings)),
             campfires=campfires,
         )
-        events = await client.notifications()
+        events = await client.pings()
         self.assertEqual(events[0]["bucket"], {"id": "55", "type": "Circle"})
         self.assertEqual(events[0]["parent"]["id"], "66")
         self.assertEqual(events[0]["_stream_id"], "ping:55")

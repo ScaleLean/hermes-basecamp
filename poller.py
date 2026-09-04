@@ -125,6 +125,8 @@ class PollClient(Protocol):
 
     async def notifications(self) -> list[Mapping[str, Any]]: ...
 
+    async def pings(self) -> list[Mapping[str, Any]]: ...
+
     async def assignments(self) -> list[Mapping[str, Any]]: ...
 
     async def timeline(self, *, limit_per_project: int | None = None) -> list[Mapping[str, Any]]: ...
@@ -140,6 +142,7 @@ class CompositePoller:
         client: PollClient,
         *,
         chat_seconds: int = 15,
+        ping_seconds: int = 10,
         notification_seconds: int = 45,
         assignment_seconds: int = 30,
         reconciliation_seconds: int = 300,
@@ -150,6 +153,7 @@ class CompositePoller:
     ) -> None:
         self.client = client
         self.chat_seconds = max(10, chat_seconds)
+        self.ping_seconds = max(10, ping_seconds)
         self.notification_seconds = max(15, notification_seconds)
         self.assignment_seconds = max(15, assignment_seconds)
         self.reconciliation_seconds = max(60, reconciliation_seconds)
@@ -159,6 +163,7 @@ class CompositePoller:
         self.inbox = inbox
         self._campfires: dict[str, str] = {}
         self._next_chat = 0.0
+        self._next_ping = 0.0
         self._next_notification = 0.0
         self._next_assignment = 0.0
         self._next_reconciliation = 0.0
@@ -171,6 +176,7 @@ class CompositePoller:
         now = self.clock()
         do_reconciliation = now >= self._next_reconciliation
         do_chat = now >= self._next_chat
+        do_pings = now >= self._next_ping
         do_notifications = now >= self._next_notification
         do_assignments = now >= self._next_assignment
 
@@ -178,6 +184,9 @@ class CompositePoller:
             await self._isolated("campfire_discovery", self._refresh_campfires())
 
         tasks: list[tuple[str, Any]] = []
+        if do_pings and hasattr(self.client, "pings"):
+            tasks.append(("pings", self.client.pings()))
+            self._next_ping = now + self.ping_seconds
         if do_chat:
             tasks.append(("chat", self._collect_chat()))
             self._next_chat = now + self.chat_seconds
