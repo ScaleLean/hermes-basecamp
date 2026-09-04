@@ -325,6 +325,14 @@ class BasecampSDKClient:
             if not recording_id:
                 continue
             updated_at = item.get("updated_at") or item.get("created_at") or item.get("due_on") or ""
+            raw_type = str(item.get("type") or "")
+            canonical_type = {
+                "todo": "Todo",
+                "card": "Kanban::Card",
+                "kanban::card": "Kanban::Card",
+                "step": "Kanban::Step",
+                "kanban::step": "Kanban::Step",
+            }.get(raw_type.lower(), raw_type)
             events.append(
                 {
                     "id": f"assignment:{recording_id}:{updated_at}",
@@ -332,7 +340,7 @@ class BasecampSDKClient:
                     "created_at": updated_at,
                     "creator": item.get("creator") or {"id": "basecamp", "name": "Basecamp"},
                     "bucket": dict(bucket),
-                    "recording": dict(item),
+                    "recording": {**item, "type": canonical_type},
                     "assignees": item.get("assignees") or [{"id": self.expected.person_id}],
                     "_stream_id": "assignments",
                 }

@@ -505,7 +505,7 @@ class BasecampAdapter(BasePlatformAdapter):
 
     async def _complete_assignment(self, pointer: Any) -> None:
         recording = pointer.raw.get("recording") or {}
-        if not isinstance(recording, Mapping) or str(recording.get("type") or "") != "Todo":
+        if not isinstance(recording, Mapping) or str(recording.get("type") or "").lower() != "todo":
             return
         await self._client.call("todos", "complete", {"todo_id": int(pointer.recording_id)})
         readback = await self._client.call("todos", "get", {"todo_id": int(pointer.recording_id)})

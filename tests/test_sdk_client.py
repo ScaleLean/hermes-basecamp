@@ -56,7 +56,7 @@ class SDKIdentityTests(unittest.IsolatedAsyncioTestCase):
         client.project_ids = ("10",)
         client.expected = ExpectedIdentity("1", "7", "agent@example.com")
         payload = {
-            "priorities": [{"id": 40, "type": "Todo", "updated_at": "2026-09-04T01:00:00Z", "bucket": {"id": 10}}],
+            "priorities": [{"id": 40, "type": "todo", "updated_at": "2026-09-04T01:00:00Z", "bucket": {"id": 10}}],
             "non_priorities": [{"id": 41, "type": "Todo", "updated_at": "2026-09-04T01:00:00Z", "bucket": {"id": 99}}],
         }
         client._account = SimpleNamespace(
@@ -65,6 +65,7 @@ class SDKIdentityTests(unittest.IsolatedAsyncioTestCase):
         events = await client.assignments()
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0]["assignees"], [{"id": "7"}])
+        self.assertEqual(events[0]["recording"]["type"], "Todo")
         self.assertEqual(events[0]["_stream_id"], "assignments")
 
     async def test_identity_match(self):
