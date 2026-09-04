@@ -102,6 +102,7 @@ class BasecampSDKClient:
             raise BasecampRuntimeError("At least one numeric Basecamp project ID is required")
         self.expected = expected
         self.project_ids = project_ids
+        self._owned_recordings: dict[str, str] = {}
         if token_provider is not None:
             provider = token_provider
         elif credentials is not None and credentials.refreshable:
@@ -186,6 +187,13 @@ class BasecampSDKClient:
         )
         if project_id != expected_project_id or project_id not in self.project_ids:
             raise OwnershipMismatchError("Basecamp canonical resource belongs to a different or denied project")
+        recording_id = str(item.get("id") or "")
+        if recording_id:
+            owned_recordings = getattr(self, "_owned_recordings", None)
+            if owned_recordings is None:
+                owned_recordings = {}
+                self._owned_recordings = owned_recordings
+            owned_recordings[recording_id] = expected_project_id
         return item
 
     async def timeline(self, *, limit_per_project: int | None = None) -> list[Mapping[str, Any]]:
@@ -486,13 +494,14 @@ class BasecampSDKClient:
     async def post_comment(self, project_id: str, recording_id: str, content: str) -> Mapping[str, Any]:
         if project_id not in self.project_ids:
             raise OwnershipMismatchError("Basecamp recording project is not allowlisted")
-        events = await self._account.events.list(recording_id=int(recording_id), max_items=100)
-        if not events or any(
-            not isinstance(event, Mapping)
-            or str((event.get("bucket") or {}).get("id") or event.get("bucket_id") or "") != project_id
-            for event in events
-        ):
-            raise OwnershipMismatchError("Basecamp recording event history does not prove project ownership")
+        if getattr(self, "_owned_recordings", {}).get(recording_id) != project_id:
+            events = await self._account.events.list(recording_id=int(recording_id), max_items=100)
+            if not events or any(
+                not isinstance(event, Mapping)
+                or str((event.get("bucket") or {}).get("id") or event.get("bucket_id") or "") != project_id
+                for event in events
+            ):
+                raise OwnershipMismatchError("Basecamp recording event history does not prove project ownership")
         return await self._account.comments.create(recording_id=int(recording_id), content=content)
 
     async def verify_chat_authorship(self, room_id: str, line_id: str) -> Mapping[str, Any]:

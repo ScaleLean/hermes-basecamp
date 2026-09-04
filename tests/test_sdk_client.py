@@ -149,6 +149,21 @@ class SDKIdentityTests(unittest.IsolatedAsyncioTestCase):
             await client.post_comment("10", "40", "denied")
         comments.create.assert_not_awaited()
 
+    async def test_canonical_recording_ownership_allows_comment(self):
+        client = object.__new__(BasecampSDKClient)
+        client.project_ids = ("10",)
+        client._owned_recordings = {}
+        events = SimpleNamespace(list=AsyncMock())
+        comments = SimpleNamespace(create=AsyncMock(return_value={"id": 50}))
+        client._account = SimpleNamespace(events=events, comments=comments)
+
+        client._require_owned({"id": 40, "bucket": {"id": 10}}, "10")
+        result = await client.post_comment("10", "40", "result")
+
+        self.assertEqual(result["id"], 50)
+        events.list.assert_not_awaited()
+        comments.create.assert_awaited_once_with(recording_id=40, content="result")
+
     async def test_call_rejects_unknown_arguments_before_sdk_dispatch(self):
         client = object.__new__(BasecampSDKClient)
         method = AsyncMock()
