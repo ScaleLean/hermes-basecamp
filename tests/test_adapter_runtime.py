@@ -178,6 +178,48 @@ class AdapterRuntimeTests(unittest.IsolatedAsyncioTestCase):
             adapter._client.post_comment.assert_not_awaited()
             self.assertEqual(adapter._deliveries.pending("event-1"), ())
 
+    async def test_durable_final_failure_is_accepted_for_plugin_reconciliation(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            client = SimpleNamespace(
+                project_ids=("10",),
+                expected=SimpleNamespace(account_id="1", person_id="7"),
+                attest_full_member=AsyncMock(),
+                resolve_target=AsyncMock(return_value=("recording", "10")),
+                post_comment=AsyncMock(side_effect=RuntimeError("write outcome is uncertain")),
+            )
+            config = PlatformConfig(
+                extra={
+                    "account_id": "1",
+                    "person_id": "7",
+                    "person_email": "agent@example.com",
+                    "mention": "@agent",
+                    "project_ids": ["10"],
+                    "access_token": "test",
+                }
+            )
+            with (
+                patch("adapter._make_client", return_value=client),
+                patch("adapter.default_replay_path", return_value=root / "replay.json"),
+                patch("adapter.configured_media_roots", return_value=(root,)),
+                patch("adapter.configured_inbound_media_root", return_value=root),
+                patch("adapter.Platform", return_value=next(iter(Platform))),
+            ):
+                adapter = BasecampAdapter(config)
+            chat_id = "bucket:10/recording:49"
+            adapter._active_dispatches[chat_id] = "event-1"
+            adapter._delivery_sequences["event-1"] = 0
+
+            result = await adapter.send(chat_id, "one durable reply")
+
+            self.assertTrue(result.success)
+            self.assertEqual(result.raw_response, {"delivery_pending": True})
+            pending = adapter._deliveries.pending("event-1")
+            self.assertEqual(len(pending), 1)
+            self.assertEqual(pending[0].target_type, "recording")
+            self.assertEqual(pending[0].state, "uncertain")
+            client.post_comment.assert_awaited_once()
+
     async def test_connect_and_disconnect_recover_webhook_leases(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -515,6 +557,7 @@ class AdapterRuntimeTests(unittest.IsolatedAsyncioTestCase):
             canonical = {
                 "id": 51,
                 "type": "Comment",
+                "title": "Re: Assignment canary: reply exactly ASSIGNMENT_DONE",
                 "content": f"{mention} Follow up on this to-do.",
                 "creator": {"id": 8, "name": "Member", "client": False},
                 "bucket": {"id": 10},
@@ -567,7 +610,10 @@ class AdapterRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 ]
             )
 
+            received_text = []
+
             async def reply(event):
+                received_text.append(event.text)
                 await adapter.send(event.source.chat_id, "FOLLOWUP_DONE")
                 await adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
 
@@ -576,6 +622,8 @@ class AdapterRuntimeTests(unittest.IsolatedAsyncioTestCase):
             await adapter._poll_once()
 
             adapter.handle_message.assert_awaited_once()
+            self.assertIn("Follow up on this to-do.", received_text[0])
+            self.assertNotIn("ASSIGNMENT_DONE", received_text[0])
             client.resolve_target.assert_awaited_once_with("49", "10")
             client.post_comment.assert_awaited_once_with("10", "49", "<div>FOLLOWUP_DONE</div>")
             client.post_chat.assert_not_awaited()

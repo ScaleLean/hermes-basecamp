@@ -95,12 +95,15 @@ def normalize_event(raw: Mapping[str, Any]) -> NormalizedEvent | None:
 
     kind = str(raw.get("kind") or raw.get("action") or "event")
     person_name = str(creator.get("name") or "Basecamp member")
-    title = recording.get("title") or recording.get("content") or raw.get("summary") or kind
+    record_type = str(recording.get("type") or raw.get("recordable_type") or "")
+    if record_type == "Comment":
+        title = recording.get("content") or recording.get("title") or raw.get("summary") or kind
+    else:
+        title = recording.get("title") or recording.get("content") or raw.get("summary") or kind
     text = f"[Basecamp {kind}] {person_name}: {_plain_text(title)}".strip()
 
     parent = raw.get("parent") or {}
     parent_id = _identifier(parent) if isinstance(parent, Mapping) else ""
-    record_type = str(recording.get("type") or raw.get("recordable_type") or "")
     bucket_type = str(bucket.get("type") or raw.get("bucket_type") or "")
     if bucket_type == "Circle":
         target_id = parent_id or recording_id

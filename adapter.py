@@ -886,6 +886,14 @@ class BasecampAdapter(BasePlatformAdapter):
                 self._verified_deliveries.add(event_id)
             return SendResult(success=True, message_id=message_id, raw_response={"items": verified_items})
         except Exception as exc:
+            event_id = self._active_dispatches.get(chat_id)
+            if event_id and await asyncio.to_thread(self._deliveries.has_final, event_id):
+                self._verified_deliveries.discard(event_id)
+                logger.warning(
+                    "[%s] Final reply accepted by the durable Basecamp journal for reconciliation",
+                    self.name,
+                )
+                return SendResult(success=True, raw_response={"delivery_pending": True})
             return SendResult(success=False, error=str(exc))
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
