@@ -2,7 +2,7 @@ import json
 import unittest
 from unittest.mock import AsyncMock, patch
 
-from basecamp_cli import BasecampCLI, ExpectedIdentity, IdentityMismatchError
+from basecamp_cli import BasecampCLI, ExpectedIdentity, IdentityMismatchError, _parser
 
 
 class _Process:
@@ -25,6 +25,18 @@ class BasecampCLITests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             self.client.command(["me"]),
             ["basecamp", "--profile", "agent", "--account", "1234567", "--json", "me"],
+        )
+
+    def test_operator_command_grammar(self):
+        self.assertTrue(_parser().parse_args(["doctor", "--probe"]).probe)
+        self.assertEqual(
+            _parser().parse_args(["webhooks", "sync", "--public-url", "https://example.test/hook"]).webhook_command,
+            "sync",
+        )
+        self.assertEqual(_parser().parse_args(["journal", "list"]).journal_command, "list")
+        self.assertEqual(
+            _parser().parse_args(["test", "live", "--campfire-id", "1", "--todolist-id", "2"]).test_command,
+            "live",
         )
 
     async def test_matching_identity_passes(self):

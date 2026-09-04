@@ -127,3 +127,7 @@ optional_env:
     description: "Explicitly confirm that a non-loopback bind is protected by a trusted TLS reverse proxy"
     prompt: "Webhook bind protected by TLS proxy?"
     password: false
+  - name: BASECAMP_WEBHOOK_PUBLIC_URL
+    description: "Stable HTTPS webhook URL registered for every allowlisted project"
+    prompt: "Basecamp webhook public URL"
+    password: false

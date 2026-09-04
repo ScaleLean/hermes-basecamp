@@ -523,11 +523,20 @@ class BasecampSDKClient:
         """Resolve an official recording target to its typed write surface and project."""
         if not recording_id.isdigit():
             raise OwnershipMismatchError("Basecamp recording target must be numeric")
+        cached_project = getattr(self, "_owned_recordings", {}).get(recording_id, "")
+        if cached_project:
+            if expected_project_id and cached_project != expected_project_id:
+                raise OwnershipMismatchError("Basecamp recording target is outside the requested project")
+            return "recording", cached_project
         try:
             room = await self._account.campfires.get(campfire_id=int(recording_id))
         except Exception as exc:
-            status = getattr(exc, "status_code", None) or getattr(exc, "status", None)
-            if status != 404:
+            status = (
+                getattr(exc, "status_code", None)
+                or getattr(exc, "status", None)
+                or getattr(exc, "http_status", None)
+            )
+            if status != 404 and getattr(exc, "code", None) != "not_found":
                 raise
         else:
             bucket = room.get("bucket") or {} if isinstance(room, Mapping) else {}
@@ -547,8 +556,12 @@ class BasecampSDKClient:
                     **{argument_name: int(recording_id)}
                 )
             except Exception as exc:
-                status = getattr(exc, "status_code", None) or getattr(exc, "status", None)
-                if status == 404:
+                status = (
+                    getattr(exc, "status_code", None)
+                    or getattr(exc, "status", None)
+                    or getattr(exc, "http_status", None)
+                )
+                if status == 404 or getattr(exc, "code", None) == "not_found":
                     continue
                 raise
             if not isinstance(result, Mapping) or str(result.get("id") or "") != recording_id:
