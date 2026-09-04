@@ -370,7 +370,8 @@ class AdapterRuntimeTests(unittest.IsolatedAsyncioTestCase):
             ):
                 adapter = BasecampAdapter(config)
 
-            result = await adapter.send_image_file("chat:10:30", str(image), "Proof")
+            adapter._chat_transcripts["bucket:10/recording:30"] = "30"
+            result = await adapter.send_image_file("bucket:10/recording:30", str(image), "Proof")
 
             self.assertTrue(result.success)
             sent = client.post_chat.await_args.args[2]
@@ -550,6 +551,11 @@ class AdapterRuntimeTests(unittest.IsolatedAsyncioTestCase):
             post_comment=AsyncMock(return_value={"id": 72}),
             verify_chat_authorship=AsyncMock(return_value={"id": 71, "creator": {"id": 7}}),
             verify_comment_authorship=AsyncMock(return_value={"id": 72, "creator": {"id": 7}}),
+            resolve_target=AsyncMock(
+                side_effect=lambda recording_id, _project_id="": (
+                    ("chat", "10") if recording_id == "30" else ("recording", "10")
+                )
+            ),
         )
         config = PlatformConfig(
             extra={
@@ -569,7 +575,11 @@ class AdapterRuntimeTests(unittest.IsolatedAsyncioTestCase):
             patch("adapter.Platform", return_value=next(iter(Platform))),
         ):
             adapter = BasecampAdapter(config)
-            for target, expected_id in (("chat:10:30", "71"), ("recording:10:40", "72")):
+            adapter._chat_transcripts["bucket:10/recording:30"] = "30"
+            for target, expected_id in (
+                ("bucket:10/recording:30", "71"),
+                ("bucket:10/recording:40", "72"),
+            ):
                 with self.subTest(target=target):
                     direct = await adapter.send(target, "Hello")
                     self.assertTrue(direct.success)
@@ -577,8 +587,11 @@ class AdapterRuntimeTests(unittest.IsolatedAsyncioTestCase):
                     standalone = await _standalone_send(config, target, "Hello")
                     self.assertEqual(standalone["message_id"], expected_id)
             client.post_chat.side_effect = RuntimeError("write failed")
-            self.assertFalse((await adapter.send("chat:10:30", "Fail")).success)
-            self.assertIn("write failed", (await _standalone_send(config, "chat:10:30", "Fail"))["error"])
+            self.assertFalse((await adapter.send("bucket:10/recording:30", "Fail")).success)
+            self.assertIn(
+                "write failed",
+                (await _standalone_send(config, "bucket:10/recording:30", "Fail"))["error"],
+            )
         client.post_chat.assert_any_await("10", "30", "<div>Hello</div>")
         client.post_comment.assert_any_await("10", "40", "<div>Hello</div>")
         client.verify_chat_authorship.assert_awaited_with("30", "71")

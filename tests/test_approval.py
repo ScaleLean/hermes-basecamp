@@ -144,7 +144,9 @@ class SensitiveToolTests(unittest.IsolatedAsyncioTestCase):
         client = Client()
         with tempfile.TemporaryDirectory() as temp, patch.dict("os.environ", {"BASECAMP_STATE_DIR": temp}):
             register_tools(context, lambda: client, "1:2")
-            tokens = session_context.set_session_vars(platform="basecamp", chat_id="chat:10:30", cron_session="")
+            tokens = session_context.set_session_vars(
+                platform="basecamp", chat_id="bucket:10/recording:30", cron_session=""
+            )
             try:
                 result = await context.handler(bucket_id="10", todo_id="40", idempotency_key="complete-40")
             finally:

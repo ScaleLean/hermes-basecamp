@@ -27,7 +27,7 @@ class TrustedContextTests(unittest.IsolatedAsyncioTestCase):
         with _trusted_values(
             HERMES_CRON_SESSION="",
             HERMES_SESSION_PLATFORM="basecamp",
-            HERMES_SESSION_CHAT_ID="chat:10:30",
+            HERMES_SESSION_CHAT_ID="bucket:10/recording:30",
         ):
             result = derive_execution_context("10", "1:2")
         self.assertIs(result.trigger, TriggerClass.DIRECT_MENTION)
@@ -41,13 +41,13 @@ class TrustedContextTests(unittest.IsolatedAsyncioTestCase):
         with _trusted_values(
             HERMES_CRON_SESSION="",
             HERMES_SESSION_PLATFORM="basecamp",
-            HERMES_SESSION_CHAT_ID="chat:10:30",
+            HERMES_SESSION_CHAT_ID="bucket:10/recording:30",
         ):
             self.assertIsNone(pre_tool_call("basecamp_todos", arguments))
         with _trusted_values(
             HERMES_CRON_SESSION="",
             HERMES_SESSION_PLATFORM="basecamp",
-            HERMES_SESSION_CHAT_ID="chat:99:30",
+            HERMES_SESSION_CHAT_ID="bucket:99/recording:30",
         ):
             self.assertEqual(pre_tool_call("basecamp_todos", arguments)["action"], "block")
 
@@ -56,7 +56,7 @@ class TrustedContextTests(unittest.IsolatedAsyncioTestCase):
             _trusted_values(
                 HERMES_CRON_SESSION="",
                 HERMES_SESSION_PLATFORM="slack",
-                HERMES_SESSION_CHAT_ID="chat:10:30",
+                HERMES_SESSION_CHAT_ID="bucket:10/recording:30",
             ),
             self.assertRaisesRegex(PermissionError, "addressed Basecamp"),
         ):
@@ -67,7 +67,7 @@ class TrustedContextTests(unittest.IsolatedAsyncioTestCase):
             _trusted_values(
                 HERMES_CRON_SESSION="",
                 HERMES_SESSION_PLATFORM="basecamp",
-                HERMES_SESSION_CHAT_ID="recording:99:40",
+                HERMES_SESSION_CHAT_ID="bucket:99/recording:40",
             ),
             self.assertRaisesRegex(PermissionError, "another project"),
         ):
@@ -77,7 +77,7 @@ class TrustedContextTests(unittest.IsolatedAsyncioTestCase):
         with _trusted_values(
             HERMES_CRON_SESSION="true",
             HERMES_CRON_AUTO_DELIVER_PLATFORM="basecamp",
-            HERMES_CRON_AUTO_DELIVER_CHAT_ID="recording:10:40",
+            HERMES_CRON_AUTO_DELIVER_CHAT_ID="bucket:10/recording:40",
         ):
             result = derive_execution_context("10", "1:2")
         self.assertIs(result.trigger, TriggerClass.APPROVED_SCHEDULE)
@@ -86,7 +86,7 @@ class TrustedContextTests(unittest.IsolatedAsyncioTestCase):
             _trusted_values(
                 HERMES_CRON_SESSION="1",
                 HERMES_CRON_AUTO_DELIVER_PLATFORM="slack",
-                HERMES_CRON_AUTO_DELIVER_CHAT_ID="chat:10:30",
+                HERMES_CRON_AUTO_DELIVER_CHAT_ID="bucket:10/recording:30",
             ),
             self.assertRaisesRegex(PermissionError, "auto-delivery"),
         ):
@@ -96,7 +96,7 @@ class TrustedContextTests(unittest.IsolatedAsyncioTestCase):
             _trusted_values(
                 HERMES_CRON_SESSION="1",
                 HERMES_CRON_AUTO_DELIVER_PLATFORM="basecamp",
-                HERMES_CRON_AUTO_DELIVER_CHAT_ID="chat:99:30",
+                HERMES_CRON_AUTO_DELIVER_CHAT_ID="bucket:99/recording:30",
             ),
             self.assertRaisesRegex(PermissionError, "another project"),
         ):
@@ -112,7 +112,7 @@ class TrustedContextTests(unittest.IsolatedAsyncioTestCase):
             with _trusted_values(
                 HERMES_CRON_SESSION="",
                 HERMES_SESSION_PLATFORM="basecamp",
-                HERMES_SESSION_CHAT_ID=f"chat:{project_id}:30",
+                HERMES_SESSION_CHAT_ID=f"bucket:{project_id}/recording:30",
             ):
                 async with lock:
                     arrivals += 1

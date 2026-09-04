@@ -41,9 +41,11 @@ class EventModelTests(unittest.TestCase):
             parse_target("general")
         with self.assertRaises(ValueError):
             parse_target("chat:not-a-number:2")
+        with self.assertRaises(ValueError):
+            parse_target("chat:22:44")
 
     def test_target_parser_accepts_explicit_target(self):
-        self.assertEqual(parse_target("chat:22:44"), ("chat", "22", "44"))
+        self.assertEqual(parse_target("bucket:22/recording:44"), ("recording", "22", "44"))
 
     def test_structured_person_mention_is_addressed(self):
         raw = {

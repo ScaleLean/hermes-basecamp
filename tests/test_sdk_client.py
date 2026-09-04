@@ -30,6 +30,15 @@ class _Account:
 
 
 class SDKIdentityTests(unittest.IsolatedAsyncioTestCase):
+    async def test_resolve_target_recognizes_allowlisted_campfire(self):
+        client = object.__new__(BasecampSDKClient)
+        client.project_ids = ("10",)
+        client._account = SimpleNamespace(
+            campfires=SimpleNamespace(get=AsyncMock(return_value={"id": 30, "bucket": {"id": 10}}))
+        )
+
+        self.assertEqual(await client.resolve_target("30", "10"), ("chat", "10"))
+
     async def test_notifications_expand_ping_to_canonical_circle_lines(self):
         client = object.__new__(BasecampSDKClient)
         client.project_ids = ("10",)
@@ -50,6 +59,58 @@ class SDKIdentityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(events[0]["bucket"], {"id": "55", "type": "Circle"})
         self.assertEqual(events[0]["parent"]["id"], "66")
         self.assertEqual(events[0]["_stream_id"], "ping:55")
+
+    async def test_notification_mention_resolves_chat_line_from_app_url(self):
+        client = object.__new__(BasecampSDKClient)
+        client.project_ids = ("10",)
+        payload = {
+            "unreads": [
+                {
+                    "id": 1,
+                    "section": "mentions",
+                    "type": "Mention",
+                    "app_url": "https://app.basecamp.com/1/buckets/10/chats/30@40",
+                    "subscription_url": (
+                        "https://3.basecampapi.com/1/buckets/10/recordings/30/subscription.json"
+                    ),
+                    "creator": {"id": 8, "client": False},
+                }
+            ]
+        }
+        client._account = SimpleNamespace(
+            my_notifications=SimpleNamespace(get_my_notifications=AsyncMock(return_value=payload))
+        )
+
+        events = await client.notifications()
+
+        self.assertEqual(events[0]["recording"], {"id": "40", "type": "Chat::Line"})
+        self.assertEqual(events[0]["parent"], {"id": "30", "type": "Chat::Transcript"})
+        self.assertEqual(events[0]["_notification_section"], "mentions")
+
+    async def test_notification_assignment_resolves_todo_from_app_url(self):
+        client = object.__new__(BasecampSDKClient)
+        client.project_ids = ("10",)
+        payload = {
+            "unreads": [
+                {
+                    "id": 2,
+                    "section": "inbox",
+                    "type": "Assignment",
+                    "app_url": "https://app.basecamp.com/1/buckets/10/todos/50",
+                    "subscription_url": (
+                        "https://3.basecampapi.com/1/buckets/10/recordings/50/subscription.json"
+                    ),
+                    "creator": {"id": 8, "client": False},
+                }
+            ]
+        }
+        client._account = SimpleNamespace(
+            my_notifications=SimpleNamespace(get_my_notifications=AsyncMock(return_value=payload))
+        )
+
+        events = await client.notifications()
+
+        self.assertEqual(events[0]["recording"], {"id": "50", "type": "Todo"})
 
     async def test_assignments_filter_denied_projects_and_name_the_stream(self):
         client = object.__new__(BasecampSDKClient)

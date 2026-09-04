@@ -178,13 +178,7 @@ def parse_target(chat_id: str) -> tuple[str, str, str]:
         return "recording", match.group(1), match.group(2)
     if re.fullmatch(r"ping:\d+", chat_id):
         return "ping", "", chat_id.split(":", 1)[1]
-    # Alpha targets remain parseable during development but are not advertised.
-    parts = chat_id.split(":", 2)
-    if len(parts) != 3 or parts[0] not in {"chat", "recording"}:
-        raise ValueError(
-            "Basecamp target must be recording:<id>, bucket:<id>, "
-            "bucket:<id>/recording:<id>, or ping:<circle_id>"
-        )
-    if not parts[1].isdigit() or not parts[2].isdigit():
-        raise ValueError("Basecamp project and recording IDs must be numeric")
-    return parts[0], parts[1], parts[2]
+    raise ValueError(
+        "Basecamp target must be recording:<id>, bucket:<id>, "
+        "bucket:<id>/recording:<id>, or ping:<circle_id>"
+    )
