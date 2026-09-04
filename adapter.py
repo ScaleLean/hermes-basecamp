@@ -438,7 +438,11 @@ class BasecampAdapter(BasePlatformAdapter):
                     await self._commit_pointer(pointer)
                     continue
                 verified_raw = dict(pointer.raw)
-                verified_raw["recording"] = canonical
+                pointer_recording = pointer.raw.get("recording") or {}
+                verified_raw["recording"] = {
+                    **(dict(pointer_recording) if isinstance(pointer_recording, Mapping) else {}),
+                    **canonical,
+                }
                 canonical_creator = canonical.get("creator") or {}
                 if isinstance(canonical_creator, Mapping) and canonical_creator.get("id"):
                     verified_raw["creator"] = canonical_creator
