@@ -1,0 +1,123 @@
+name: basecamp-platform
+label: Basecamp
+kind: platform
+version: 0.2.0a2
+description: >
+  Bring a Hermes agent into Basecamp as a dedicated member with its own
+  identity, project access, and activity history.
+author: Scale Lean
+license: MIT
+homepage: https://github.com/ScaleLean/hermes-basecamp
+tags:
+  - basecamp
+  - collaboration
+  - agents
+python_dependencies:
+  - "basecamp-sdk>=0.16.0,<0.17"
+  - "markdown-it-py>=3,<5"
+provides_tools:
+  - basecamp_projects_people
+  - basecamp_todos
+  - basecamp_messages
+  - basecamp_cards
+  - basecamp_schedules_checkins
+  - basecamp_files
+  - basecamp_discovery
+  - basecamp_extras
+provides_hooks:
+  - pre_tool_call
+  - post_approval_response
+requires_env:
+  - name: BASECAMP_ACCOUNT_ID
+    description: "Numeric Basecamp account ID"
+    prompt: "Basecamp account ID"
+    password: false
+  - name: BASECAMP_PERSON_ID
+    description: "Per-account Basecamp person ID for this agent"
+    prompt: "Basecamp person ID"
+    password: false
+  - name: BASECAMP_PERSON_EMAIL
+    description: "Dedicated member email for this Hermes agent"
+    prompt: "Basecamp member email"
+    password: false
+  - name: BASECAMP_AGENT_MENTION
+    description: "Exact text that addresses this agent, for example @HermesAgent"
+    prompt: "Basecamp mention text"
+    password: false
+  - name: BASECAMP_PROJECT_IDS
+    description: "Comma-separated project IDs this agent may access"
+    prompt: "Allowed Basecamp project IDs"
+    password: false
+optional_env:
+  - name: BASECAMP_OAUTH_TOKEN_FILE
+    description: "Owner-only JSON token file created by a Basecamp OAuth onboarding command"
+    prompt: "Basecamp OAuth token file"
+    password: false
+  - name: BASECAMP_ACCESS_TOKEN
+    description: "Short-lived OAuth access token fallback"
+    prompt: "Basecamp OAuth access token"
+    password: true
+  - name: BASECAMP_REFRESH_TOKEN
+    description: "OAuth refresh token for durable access"
+    prompt: "Basecamp OAuth refresh token"
+    password: true
+  - name: BASECAMP_CLIENT_ID
+    description: "OAuth application client ID"
+    prompt: "Basecamp OAuth client ID"
+    password: true
+  - name: BASECAMP_CLIENT_SECRET
+    description: "OAuth application client secret"
+    prompt: "Basecamp OAuth client secret"
+    password: true
+  - name: BASECAMP_TOKEN_EXPIRES_AT
+    description: "Access-token expiry as Unix epoch seconds"
+    prompt: "Basecamp token expiry"
+    password: false
+  - name: BASECAMP_POLL_CHAT_SECONDS
+    description: "Campfire polling interval, minimum 10 seconds"
+    prompt: "Basecamp chat poll interval"
+    password: false
+  - name: BASECAMP_POLL_NOTIFY_SECONDS
+    description: "Notification polling interval, minimum 15 seconds"
+    prompt: "Basecamp notification poll interval"
+    password: false
+  - name: BASECAMP_RECONCILE_SECONDS
+    description: "Timeline reconciliation interval, minimum 60 seconds"
+    prompt: "Basecamp reconciliation interval"
+    password: false
+  - name: BASECAMP_HOME_CHANNEL
+    description: "Default cron target, such as chat:PROJECT_ID:CAMPFIRE_ID"
+    prompt: "Basecamp home channel"
+    password: false
+  - name: BASECAMP_ALLOWED_USERS
+    description: "Comma-separated Basecamp person IDs allowed to trigger Hermes"
+    prompt: "Allowed Basecamp person IDs"
+    password: false
+  - name: BASECAMP_ALLOW_ALL_USERS
+    description: "Allow any Basecamp member to trigger Hermes"
+    prompt: "Allow all Basecamp members?"
+    password: false
+  - name: BASECAMP_STATE_DIR
+    description: "Owner-only directory for durable cursors, replay state, and operation journals"
+    prompt: "Basecamp state directory"
+    password: false
+  - name: BASECAMP_MEDIA_ROOTS
+    description: "Path-separated roots from which Hermes may upload files"
+    prompt: "Allowed Basecamp media roots"
+    password: false
+  - name: BASECAMP_WEBHOOK_TOKEN
+    description: "Random token embedded in the private Basecamp webhook path"
+    prompt: "Basecamp webhook token"
+    password: true
+  - name: BASECAMP_WEBHOOK_HOST
+    description: "Local HTTP bind host for the Basecamp webhook receiver"
+    prompt: "Basecamp webhook bind host"
+    password: false
+  - name: BASECAMP_WEBHOOK_PORT
+    description: "Local HTTP bind port for the Basecamp webhook receiver"
+    prompt: "Basecamp webhook bind port"
+    password: false
+  - name: BASECAMP_WEBHOOK_TLS_PROXY
+    description: "Explicitly confirm that a non-loopback bind is protected by a trusted TLS reverse proxy"
+    prompt: "Webhook bind protected by TLS proxy?"
+    password: false
