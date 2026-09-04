@@ -116,11 +116,16 @@ async def probe_runtime(client: Any, inbox: Any) -> dict[str, Any]:
             if len(matches) != 1:
                 webhook_state = "drifted"
                 break
-    state = "ready" if lane_ok and webhook_state == "healthy" else "recovering"
+    inbox_health = inbox.stats()
+    state = (
+        "ready"
+        if lane_ok and webhook_state == "healthy" and inbox_health.get("poison", 0) == 0
+        else "recovering"
+    )
     return {
         "state": state,
         "lanes": lanes,
-        "inbox": inbox.stats(),
+        "inbox": inbox_health,
         "webhook_registration": webhook_state,
     }
 

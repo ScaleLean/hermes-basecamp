@@ -139,7 +139,7 @@ class SDKIdentityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(events[0]["assignees"], [{"id": 7}])
         self.assertEqual(events[0]["creator"]["id"], 8)
         self.assertEqual(events[0]["created_at"], "2026-09-04T02:00:00Z")
-        self.assertEqual(events[0]["id"], "assignment:40:2026-09-04T02:00:00Z")
+        self.assertEqual(events[0]["id"], "assignment:40")
         self.assertEqual(events[0]["recording"]["type"], "Todo")
         self.assertEqual(events[0]["_stream_id"], "assignments")
         get_todo.assert_awaited_once_with(todo_id=40)
@@ -224,6 +224,34 @@ class SDKIdentityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["id"], 50)
         events.list.assert_not_awaited()
         comments.create.assert_awaited_once_with(recording_id=40, content="result")
+
+    async def test_uncertain_comment_reconciliation_finds_agent_authored_exact_content(self):
+        client = object.__new__(BasecampSDKClient)
+        client.expected = ExpectedIdentity("1", "7", "agent@example.com")
+        comments = SimpleNamespace(
+            list=AsyncMock(return_value=[
+                {"id": 1, "content": "result", "creator": {"id": 8}, "created_at": "2026-09-04T01:00:00Z"},
+                {"id": 2, "content": "result", "creator": {"id": 7}, "created_at": "2026-09-04T01:00:00Z"},
+            ])
+        )
+        client._account = SimpleNamespace(comments=comments)
+
+        matched = await client.reconcile_delivery("recording", "40", "result")
+
+        self.assertEqual(matched["id"], 2)
+        comments.list.assert_awaited_once_with(recording_id=40, max_items=100)
+
+    async def test_uncertain_chat_reconciliation_uses_known_item_id_first(self):
+        client = object.__new__(BasecampSDKClient)
+        client.expected = ExpectedIdentity("1", "7", "agent@example.com")
+        line = {"id": 3, "content": "hello", "creator": {"id": 7}}
+        campfires = SimpleNamespace(get_line=AsyncMock(return_value=line), list_lines=AsyncMock())
+        client._account = SimpleNamespace(campfires=campfires)
+
+        matched = await client.reconcile_delivery("chat", "30", "hello", item_id="3")
+
+        self.assertEqual(matched, line)
+        campfires.list_lines.assert_not_awaited()
 
     async def test_call_rejects_unknown_arguments_before_sdk_dispatch(self):
         client = object.__new__(BasecampSDKClient)

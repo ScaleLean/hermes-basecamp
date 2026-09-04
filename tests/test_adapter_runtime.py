@@ -10,10 +10,34 @@ from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import ProcessingOutcome, SendResult
 
 from adapter import BasecampAdapter, _standalone_send
+from delivery_journal import DeliveryJournal
 from webhook_ingress import DurableWebhookStore, WebhookIngress
 
 
 class AdapterRuntimeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_uncertain_reply_reconciles_without_a_second_write(self):
+        with tempfile.TemporaryDirectory() as temp:
+            adapter = object.__new__(BasecampAdapter)
+            adapter._deliveries = DeliveryJournal(Path(temp) / "deliveries.sqlite3")
+            adapter._deliveries.reserve(
+                event_id="event-1", sequence=0, chat_id="recording:40",
+                target_type="recording", project_id="10", target_id="40", content="result",
+            )
+            adapter._deliveries.transition("event-1", 0, "dispatched")
+            delivery = adapter._deliveries.pending("event-1")[0]
+            adapter._client = SimpleNamespace(
+                reconcile_delivery=AsyncMock(
+                    return_value={"id": 50, "content": "result", "creator": {"id": 7}}
+                ),
+                post_comment=AsyncMock(),
+            )
+
+            item_id = await adapter._deliver_reserved(delivery, reconcile_first=True)
+
+            self.assertEqual(item_id, "50")
+            adapter._client.post_comment.assert_not_awaited()
+            self.assertEqual(adapter._deliveries.pending("event-1"), ())
+
     async def test_connect_and_disconnect_recover_webhook_leases(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

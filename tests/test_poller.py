@@ -150,6 +150,33 @@ class PollerTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(inbox.after_cursor("campfire:20:30", [{"id": 1, "created_at": "2026-09-04T01:00:00Z"}]), [])
             self.assertEqual(inbox.after_cursor("campfire:20:31", [{"id": 1, "created_at": "2026-09-04T01:00:00Z"}]), [])
 
+    async def test_assignment_snapshot_does_not_repeat_when_recording_changes(self):
+        from inbox import DurableInbox
+
+        class ChangingAssignment(_Client):
+            version = 0
+
+            async def assignments(self):
+                self.version += 1
+                return [{
+                    "id": "assignment:40",
+                    "updated_at": str(self.version),
+                    "recording": {"id": 40},
+                    "_stream_id": "assignments",
+                }]
+
+        with tempfile.TemporaryDirectory() as temp:
+            inbox = DurableInbox(Path(temp) / "inbox.sqlite3")
+            client = ChangingAssignment()
+            await CompositePoller(client, clock=lambda: 1000, inbox=inbox).collect()
+            claimed_keys = []
+            while claimed := inbox.claim():
+                claimed_keys.append(claimed.key)
+                inbox.complete(claimed)
+            self.assertIn("snapshot:assignments:40:1", claimed_keys)
+            await CompositePoller(client, clock=lambda: 2000, inbox=inbox).collect()
+            self.assertIsNone(inbox.claim())
+
     def test_cursor_never_regresses_and_reloads_other_process_state(self):
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "cursor.json"

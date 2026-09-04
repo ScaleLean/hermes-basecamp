@@ -6,6 +6,7 @@ import inspect
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any
 
 try:
@@ -379,7 +380,7 @@ class BasecampSDKClient:
             )
             events.append(
                 {
-                    "id": f"assignment:{recording_id}:{updated_at}",
+                    "id": f"assignment:{recording_id}",
                     "kind": "assignment_created",
                     "created_at": updated_at,
                     "creator": canonical.get("creator") or item.get("creator") or {},
@@ -593,6 +594,52 @@ class BasecampSDKClient:
 
     async def verify_comment_authorship(self, comment_id: str) -> Mapping[str, Any]:
         return self._verify_creator(await self._account.comments.get(comment_id=int(comment_id)))
+
+    async def reconcile_delivery(
+        self,
+        target_type: str,
+        target_id: str,
+        content: str,
+        *,
+        item_id: str = "",
+        not_before: float = 0,
+    ) -> Mapping[str, Any] | None:
+        """Find canonical proof for an uncertain reply without creating another write."""
+        if item_id:
+            try:
+                if target_type == "chat":
+                    return await self.verify_chat_authorship(target_id, item_id)
+                if target_type == "question":
+                    return self.verify_creator(
+                        await self._account.checkins.get_answer(answer_id=int(item_id))
+                    )
+                return await self.verify_comment_authorship(item_id)
+            except Exception as exc:
+                status = getattr(exc, "status_code", None) or getattr(exc, "status", None)
+                if status != 404 and getattr(exc, "code", None) != "not_found":
+                    raise
+        if target_type == "chat":
+            items = await self._account.campfires.list_lines(campfire_id=int(target_id), max_items=100)
+        elif target_type == "question":
+            items = await self._account.checkins.list_answers(question_id=int(target_id), max_items=100)
+        else:
+            items = await self._account.comments.list(recording_id=int(target_id), max_items=100)
+        matches = []
+        for item in items:
+            if not isinstance(item, Mapping) or str(item.get("content") or "") != content:
+                continue
+            created_at = str(item.get("created_at") or "")
+            if not_before:
+                try:
+                    created_timestamp = datetime.fromisoformat(created_at).timestamp()
+                except ValueError:
+                    continue
+                if created_timestamp < not_before - 120:
+                    continue
+            creator = item.get("creator") or {}
+            if isinstance(creator, Mapping) and str(creator.get("id") or "") == self.expected.person_id:
+                matches.append(item)
+        return matches[-1] if matches else None
 
     def _verify_creator(self, item: Mapping[str, Any]) -> Mapping[str, Any]:
         creator = item.get("creator") or {}

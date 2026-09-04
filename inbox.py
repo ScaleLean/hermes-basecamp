@@ -91,6 +91,14 @@ class DurableInbox:
                     ids_json TEXT NOT NULL,
                     updated_at REAL NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS inbox_snapshot_state (
+                    stream_id TEXT NOT NULL,
+                    resource_id TEXT NOT NULL,
+                    generation INTEGER NOT NULL,
+                    active INTEGER NOT NULL,
+                    updated_at REAL NOT NULL,
+                    PRIMARY KEY(stream_id, resource_id)
+                );
                 CREATE TABLE IF NOT EXISTS active_recordings (
                     scope_id TEXT NOT NULL,
                     recording_id TEXT NOT NULL,
@@ -155,6 +163,92 @@ class DurableInbox:
                         recording_id,
                         creator_id,
                         json.dumps(payload, separators=(",", ":"), default=str),
+                        now,
+                        now,
+                        now,
+                    ),
+                )
+                accepted += cursor.rowcount
+            self._advance_cursor(connection, stream_id, events, now)
+            self._prune(connection, now)
+            connection.commit()
+            return accepted
+
+    def accept_snapshot_batch(
+        self,
+        source_type: str,
+        stream_id: str,
+        events: Sequence[Mapping[str, Any]],
+    ) -> int:
+        """Accept each resource once per continuous appearance in a snapshot stream."""
+        now = time.time()
+        resources: dict[str, Mapping[str, Any]] = {}
+        for payload in events:
+            recording = payload.get("recording") or payload.get("recordable") or payload
+            resource_id = str(recording.get("id") or "") if isinstance(recording, Mapping) else ""
+            if not resource_id:
+                raise ValueError("Snapshot event is missing a recording ID")
+            resources[resource_id] = payload
+
+        with closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self._recover_expired(connection, now)
+            prior_rows = connection.execute(
+                "SELECT resource_id, generation, active FROM inbox_snapshot_state WHERE stream_id=?",
+                (stream_id,),
+            ).fetchall()
+            prior = {str(row["resource_id"]): row for row in prior_rows}
+            new_ids = [resource_id for resource_id in resources if not prior.get(resource_id) or not prior[resource_id]["active"]]
+            active = connection.execute(
+                "SELECT COUNT(*) FROM inbox_events WHERE state IN ('pending', 'processing')"
+            ).fetchone()[0]
+            if active + len(new_ids) > self.max_pending:
+                connection.rollback()
+                raise RuntimeError("Basecamp inbox is full; snapshot state was not advanced")
+
+            connection.execute(
+                "UPDATE inbox_snapshot_state SET active=0, updated_at=? WHERE stream_id=? AND active=1",
+                (now, stream_id),
+            )
+            accepted = 0
+            for resource_id, payload in resources.items():
+                row = prior.get(resource_id)
+                generation = int(row["generation"]) if row else 0
+                is_new_epoch = row is None or not bool(row["active"])
+                if is_new_epoch:
+                    generation += 1
+                connection.execute(
+                    """INSERT INTO inbox_snapshot_state(stream_id, resource_id, generation, active, updated_at)
+                       VALUES (?, ?, ?, 1, ?)
+                       ON CONFLICT(stream_id, resource_id) DO UPDATE SET
+                           generation=excluded.generation, active=1, updated_at=excluded.updated_at""",
+                    (stream_id, resource_id, generation, now),
+                )
+                if not is_new_epoch:
+                    continue
+                stored = dict(payload)
+                stored["_snapshot_generation"] = generation
+                stored["id"] = f"{stream_id}:{resource_id}:generation:{generation}"
+                recording = stored.get("recording") or stored.get("recordable") or stored
+                bucket = stored.get("bucket") or stored.get("project") or {}
+                creator = stored.get("creator") or stored.get("person") or {}
+                scope_id = str(bucket.get("id") or stored.get("bucket_id") or "") if isinstance(bucket, Mapping) else ""
+                creator_id = str(creator.get("id") or "") if isinstance(creator, Mapping) else ""
+                key = f"snapshot:{stream_id}:{resource_id}:{generation}"
+                cursor = connection.execute(
+                    """INSERT OR IGNORE INTO inbox_events
+                       (event_key, source_type, stream_id, event_version, scope_id, recording_id,
+                        creator_id, payload_json, state, attempts, available_at, received_at, updated_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?)""",
+                    (
+                        key,
+                        source_type,
+                        stream_id,
+                        str(generation),
+                        scope_id,
+                        resource_id,
+                        creator_id,
+                        json.dumps(stored, separators=(",", ":"), default=str),
                         now,
                         now,
                         now,

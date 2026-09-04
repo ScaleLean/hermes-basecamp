@@ -15,10 +15,12 @@ if __name__ == "tools" and _hermes_spec and _hermes_spec.origin:
 try:
     from .operations import BasecampOperations
     from .policy import ExecutionContext, TriggerClass, default_registry, requires_action_approval
+    from .sdk_routes import SDK_ROUTES
     from .trusted_context import derive_execution_context
 except ImportError:  # pragma: no cover
     from operations import BasecampOperations
     from policy import ExecutionContext, TriggerClass, default_registry, requires_action_approval
+    from sdk_routes import SDK_ROUTES
     from trusted_context import derive_execution_context
 
 
@@ -82,11 +84,13 @@ TOOL_SCHEMAS = {
         ("bucket_id", "question_id", "content", "idempotency_key"),
     ),
     "basecamp_api_read": _schema(
-        {"path": TEXT, "query": {"type": "object", "additionalProperties": {"type": "string"}}}, ("path",)
+        {"bucket_id": ID, "path": TEXT, "query": {"type": "object", "additionalProperties": True}},
+        ("bucket_id", "path"),
     ),
     "basecamp_api_write": _schema(
-        {"method": {"type": "string", "enum": ["POST", "PUT", "DELETE"]}, "path": TEXT,
-         "body": {"type": "object"}, "idempotency_key": KEY}, ("method", "path", "idempotency_key")
+        {"bucket_id": ID, "method": {"type": "string", "enum": ["POST", "PUT", "DELETE"]}, "path": TEXT,
+         "body": {"type": "object"}, "idempotency_key": KEY},
+        ("bucket_id", "method", "path", "idempotency_key"),
     ),
 }
 
@@ -138,32 +142,10 @@ async def _history(client: Any, values: Mapping[str, Any]) -> dict[str, Any]:
     return {"ok": True, "items": result.value}
 
 
-API_ROUTES: tuple[tuple[str, str, str, tuple[str, ...]], ...] = (
-    ("GET", r"/projects\.json", "projects.list", ()),
-    ("GET", r"/projects/(?P<project_id>\d+)\.json", "projects.get", ()),
-    ("GET", r"/projects/(?P<project_id>\d+)/people\.json", "people.list", ()),
-    ("GET", r"/buckets/(?P<bucket_id>\d+)/todos/(?P<todo_id>\d+)\.json", "todos.get", ()),
-    ("GET", r"/buckets/(?P<bucket_id>\d+)/todolists/(?P<todolist_id>\d+)/todos\.json", "todos.list", ()),
-    ("GET", r"/buckets/(?P<bucket_id>\d+)/recordings/(?P<recording_id>\d+)/comments\.json", "comments.list", ()),
-    ("GET", r"/buckets/(?P<bucket_id>\d+)/chats/(?P<campfire_id>\d+)/lines\.json", "campfire.history", ()),
-    ("GET", r"/buckets/(?P<bucket_id>\d+)/documents/(?P<document_id>\d+)\.json", "documents.get", ()),
-    ("GET", r"/buckets/(?P<bucket_id>\d+)/card_tables/cards/(?P<card_id>\d+)\.json", "cards.get", ()),
-    ("GET", r"/buckets/(?P<bucket_id>\d+)/messages/(?P<message_id>\d+)\.json", "messages.get", ()),
-    ("POST", r"/buckets/(?P<bucket_id>\d+)/recordings/(?P<recording_id>\d+)/comments\.json", "comments.create", ("content",)),
-    ("PUT", r"/buckets/(?P<bucket_id>\d+)/todos/(?P<todo_id>\d+)\.json", "todos.update", ()),
-    ("POST", r"/buckets/(?P<bucket_id>\d+)/todolists/(?P<todolist_id>\d+)/todos\.json", "todos.create", ("content",)),
-    ("POST", r"/buckets/(?P<bucket_id>\d+)/todos/(?P<todo_id>\d+)/completion\.json", "todos.complete", ()),
-    ("DELETE", r"/buckets/(?P<bucket_id>\d+)/todos/(?P<todo_id>\d+)/completion\.json", "todos.restore", ()),
-    ("POST", r"/buckets/(?P<bucket_id>\d+)/message_boards/(?P<board_id>\d+)/messages\.json", "messages.create", ("subject",)),
-    ("PUT", r"/buckets/(?P<bucket_id>\d+)/card_tables/cards/(?P<card_id>\d+)/moves\.json", "cards.move", ("column_id",)),
-    ("POST", r"/buckets/(?P<bucket_id>\d+)/questions/(?P<question_id>\d+)/answers\.json", "checkins.answer", ("content",)),
-)
-
-
 def _resolve_api_route(method: str, path: str) -> tuple[str, str, dict[str, Any], tuple[str, ...]]:
     if "//" in path or ".." in path or "?" in path or "#" in path:
         raise PermissionError("Basecamp API path must be a relative canonical path")
-    for expected_method, pattern, capability, required_body in API_ROUTES:
+    for expected_method, pattern, capability in SDK_ROUTES:
         match = re.fullmatch(pattern, path)
         if match and method == expected_method:
             return (
@@ -174,13 +156,16 @@ def _resolve_api_route(method: str, path: str) -> tuple[str, str, dict[str, Any]
                     for key, value in match.groupdict().items()
                     if value is not None and key != "bucket_id"
                 },
-                required_body,
+                (),
             )
     raise PermissionError("Basecamp API method and path are not in the reviewed typed SDK route inventory")
 
 
 async def _api(client: Any, method: str, values: Mapping[str, Any]) -> dict[str, Any]:
-    capability, bucket_id, arguments, required_body = _resolve_api_route(method, str(values["path"]))
+    capability, path_bucket_id, arguments, required_body = _resolve_api_route(method, str(values["path"]))
+    bucket_id = str(values["bucket_id"])
+    if path_bucket_id and path_bucket_id != bucket_id:
+        raise PermissionError("Basecamp API path project does not match the explicit project scope")
     body = values.get("body") or {}
     query = values.get("query") or {}
     if not isinstance(body, Mapping) or not isinstance(query, Mapping):
@@ -190,8 +175,6 @@ async def _api(client: Any, method: str, values: Mapping[str, Any]) -> dict[str,
         raise ValueError(f"Basecamp API body is missing required fields: {', '.join(missing)}")
     arguments.update(body if method != "GET" else query)
     profile_id = f"{client.expected.account_id}:{client.expected.person_id}"
-    if not bucket_id and capability == "projects.list":
-        bucket_id = client.project_ids[0]
     context = (
         ExecutionContext(TriggerClass.UNATTENDED, bucket_id, profile_id)
         if method == "GET"

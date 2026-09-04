@@ -60,6 +60,33 @@ class DurableInboxTests(unittest.TestCase):
             new = {"id": "assignment:41", "recording": {"id": 41}}
             self.assertEqual(inbox.after_cursor("assignments", [assigned, new]), [new])
 
+    def test_snapshot_accepts_one_event_per_continuous_assignment_epoch(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "inbox.sqlite3"
+            inbox = DurableInbox(path)
+            first = {"id": "assignment:40", "updated_at": "one", "recording": {"id": 40}}
+            changed = {"id": "assignment:40", "updated_at": "two", "recording": {"id": 40}}
+            self.assertEqual(inbox.accept_snapshot_batch("poll", "assignments", [first]), 1)
+            self.assertEqual(inbox.accept_snapshot_batch("poll", "assignments", [changed]), 0)
+            claimed = inbox.claim()
+            self.assertEqual(claimed.key, "snapshot:assignments:40:1")
+            inbox.complete(claimed)
+
+            self.assertEqual(inbox.accept_snapshot_batch("poll", "assignments", []), 0)
+            restarted = DurableInbox(path)
+            self.assertEqual(restarted.accept_snapshot_batch("poll", "assignments", [changed]), 1)
+            self.assertEqual(restarted.claim().key, "snapshot:assignments:40:2")
+
+    def test_snapshot_resources_are_independent_and_state_is_transactional(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "inbox.sqlite3"
+            first = {"id": "assignment:40", "recording": {"id": 40}}
+            second = {"id": "assignment:41", "recording": {"id": 41}}
+            inbox = DurableInbox(path, max_pending=1)
+            with self.assertRaisesRegex(RuntimeError, "snapshot state was not advanced"):
+                inbox.accept_snapshot_batch("poll", "assignments", [first, second])
+            self.assertEqual(inbox.accept_snapshot_batch("poll", "assignments", [first]), 1)
+
     def test_payload_is_removed_from_terminal_record(self):
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "inbox.sqlite3"

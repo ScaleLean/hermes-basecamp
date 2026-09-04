@@ -22,6 +22,7 @@ from gateway.platforms.base import (
 )
 
 try:
+    from .delivery_journal import Delivery, DeliveryJournal
     from .event_model import is_addressed_to, normalize_event, parse_target
     from .formatter import format_chunks
     from .inbox import DurableInbox
@@ -39,6 +40,7 @@ try:
     )
     from .webhook_ingress import WebhookHTTPReceiver, WebhookIngress
 except ImportError:  # pragma: no cover - installed flat-module wheel
+    from delivery_journal import Delivery, DeliveryJournal
     from event_model import is_addressed_to, normalize_event, parse_target
     from formatter import format_chunks
     from inbox import DurableInbox
@@ -188,6 +190,7 @@ class BasecampAdapter(BasePlatformAdapter):
         self._processing_waiters: dict[str, asyncio.Future[ProcessingOutcome]] = {}
         self._active_dispatches: dict[str, str] = {}
         self._verified_deliveries: set[str] = set()
+        self._delivery_sequences: dict[str, int] = {}
         self._chat_transcripts: dict[str, str] = {}
         self._target_types: dict[str, str] = {}
         self._poll_seconds = 10
@@ -196,6 +199,11 @@ class BasecampAdapter(BasePlatformAdapter):
         self._inbox = DurableInbox(
             default_replay_path(values["account_id"], values["person_id"]).with_name(
                 f"{values['account_id']}-{values['person_id']}-inbox.sqlite3"
+            )
+        )
+        self._deliveries = DeliveryJournal(
+            default_replay_path(values["account_id"], values["person_id"]).with_name(
+                f"{values['account_id']}-{values['person_id']}-deliveries.sqlite3"
             )
         )
         self._poller = CompositePoller(
@@ -338,7 +346,10 @@ class BasecampAdapter(BasePlatformAdapter):
 
     def _receive_lanes_ready(self) -> bool:
         required = {"campfire_discovery", "chat", "notifications", "assignments", "reconciliation"}
-        return required.issubset(getattr(self._health, "lane_last_success", {}))
+        return (
+            required.issubset(getattr(self._health, "lane_last_success", {}))
+            and self._inbox.stats().get("poison", 0) == 0
+        )
 
     async def _verify_webhook_registration(self) -> bool:
         if not self._webhook_server or not self._webhook_public_url:
@@ -447,6 +458,15 @@ class BasecampAdapter(BasePlatformAdapter):
                 verified_recording = verified.raw.get("recording") or {}
                 if isinstance(verified_recording, Mapping):
                     self._target_types[verified.chat_id] = str(verified_recording.get("type") or "")
+                is_assignment = verified.kind == "assignment_created"
+                if await asyncio.to_thread(self._deliveries.has_any, verified.event_id):
+                    final_delivery = await self._resume_deliveries(verified)
+                    if final_delivery:
+                        if is_assignment:
+                            await self._complete_assignment(verified)
+                        self._health.last_completed_run_at = __import__("time").time()
+                        await self._commit_pointer(pointer)
+                        continue
                 participants = verified.raw.get("participants") or []
                 source = self.build_source(
                     chat_id=verified.chat_id,
@@ -484,7 +504,9 @@ class BasecampAdapter(BasePlatformAdapter):
                 completion = asyncio.get_running_loop().create_future()
                 self._processing_waiters[verified.event_id] = completion
                 self._active_dispatches[verified.chat_id] = verified.event_id
-                is_assignment = verified.kind == "assignment_created"
+                self._delivery_sequences[verified.event_id] = await asyncio.to_thread(
+                    self._deliveries.next_sequence, verified.event_id
+                )
                 acknowledgement = asyncio.create_task(
                     self._acknowledge_later(verified, 60.0 if is_assignment else 25.0)
                 ) if is_assignment or is_ping or str((verified.raw.get("recording") or {}).get("type") or "") == "Chat::Line" else None
@@ -495,6 +517,7 @@ class BasecampAdapter(BasePlatformAdapter):
                     self._processing_waiters.pop(verified.event_id, None)
                     if self._active_dispatches.get(verified.chat_id) == verified.event_id:
                         self._active_dispatches.pop(verified.chat_id, None)
+                    self._delivery_sequences.pop(verified.event_id, None)
                     if acknowledgement:
                         acknowledgement.cancel()
                         try:
@@ -504,6 +527,8 @@ class BasecampAdapter(BasePlatformAdapter):
                 delivery_verified = verified.event_id in self._verified_deliveries
                 self._verified_deliveries.discard(verified.event_id)
                 if outcome is not ProcessingOutcome.SUCCESS or not delivery_verified:
+                    if await asyncio.to_thread(self._deliveries.has_final, verified.event_id):
+                        raise RuntimeError("Basecamp reply is uncertain and requires delivery reconciliation")
                     if is_assignment:
                         await self._post_assignment_status(
                             verified, "I could not complete this work. The assigned item remains open."
@@ -539,20 +564,37 @@ class BasecampAdapter(BasePlatformAdapter):
         await asyncio.sleep(delay)
         content = "I received this and am working on it."
         if pointer.kind == "assignment_created":
-            await self._post_assignment_status(pointer, content)
+            await self._post_assignment_status(pointer, content, purpose="acknowledgement")
         else:
             result = await self.send(pointer.chat_id, content)
             if not result.success:
                 raise BasecampRuntimeError(result.error or "Basecamp acknowledgement failed")
 
-    async def _post_assignment_status(self, pointer: Any, content: str) -> None:
-        result = await self._client.post_comment(
-            pointer.project_id, pointer.recording_id, format_chunks(content, max_length=MAX_MESSAGE_LENGTH)[0]
-        )
-        comment_id = str(result.get("id") or "")
+    async def _post_assignment_status(self, pointer: Any, content: str, *, purpose: str = "status") -> None:
+        chunk = format_chunks(content, max_length=MAX_MESSAGE_LENGTH)[0]
+        event_id = self._active_dispatches.get(pointer.chat_id)
+        if event_id:
+            sequence = self._delivery_sequences.get(event_id, 0)
+            self._delivery_sequences[event_id] = sequence + 1
+            delivery = await asyncio.to_thread(
+                self._deliveries.reserve,
+                event_id=event_id,
+                sequence=sequence,
+                chat_id=pointer.chat_id,
+                target_type="recording",
+                project_id=pointer.project_id,
+                target_id=pointer.recording_id,
+                content=chunk,
+                purpose=purpose,
+            )
+            comment_id = await self._deliver_reserved(delivery, reconcile_first=delivery.state != "reserved")
+        else:
+            result = await self._client.post_comment(pointer.project_id, pointer.recording_id, chunk)
+            comment_id = str(result.get("id") or "")
         if not comment_id:
             raise BasecampRuntimeError("Basecamp assignment status comment lacked an ID")
-        await self._client.verify_comment_authorship(comment_id)
+        if not event_id:
+            await self._client.verify_comment_authorship(comment_id)
         await asyncio.to_thread(self._inbox.activate, pointer.project_id, pointer.recording_id)
 
     async def _complete_assignment(self, pointer: Any) -> None:
@@ -569,6 +611,66 @@ class BasecampAdapter(BasePlatformAdapter):
             or str(bucket.get("id") or "") != pointer.project_id
         ):
             raise BasecampRuntimeError("Basecamp to-do completion read-back failed")
+
+    async def _resume_deliveries(self, pointer: Any) -> bool:
+        pending = await asyncio.to_thread(self._deliveries.pending, pointer.event_id)
+        for delivery in pending:
+            await self._deliver_reserved(delivery, reconcile_first=delivery.state != "reserved")
+        has_final = await asyncio.to_thread(self._deliveries.has_final, pointer.event_id)
+        if has_final:
+            self._verified_deliveries.add(pointer.event_id)
+        return has_final
+
+    async def _deliver_reserved(self, delivery: Delivery, *, reconcile_first: bool) -> str:
+        if reconcile_first:
+            verified = await self._client.reconcile_delivery(
+                delivery.target_type,
+                delivery.target_id,
+                delivery.content,
+                item_id=delivery.item_id,
+                not_before=delivery.created_at,
+            )
+            if verified is not None:
+                item_id = str(verified.get("id") or delivery.item_id)
+                await asyncio.to_thread(
+                    self._deliveries.transition, delivery.event_id, delivery.sequence, "verified", item_id=item_id
+                )
+                return item_id
+        await asyncio.to_thread(
+            self._deliveries.transition, delivery.event_id, delivery.sequence, "dispatched"
+        )
+        try:
+            if delivery.target_type == "chat":
+                result = await self._client.post_chat(delivery.project_id, delivery.target_id, delivery.content)
+            elif delivery.target_type == "question":
+                result = await self._client.call(
+                    "checkins", "create_answer", {"question_id": int(delivery.target_id), "content": delivery.content}
+                )
+            else:
+                result = await self._client.post_comment(delivery.project_id, delivery.target_id, delivery.content)
+            item_id = str(result.get("id") or "")
+            if not item_id:
+                raise BasecampRuntimeError("Basecamp write lacked an item ID")
+            await asyncio.to_thread(
+                self._deliveries.transition, delivery.event_id, delivery.sequence, "uncertain", item_id=item_id
+            )
+            if delivery.target_type == "chat":
+                await self._client.verify_chat_authorship(delivery.target_id, item_id)
+            elif delivery.target_type == "question":
+                self._client.verify_creator(
+                    await self._client.call("checkins", "get_answer", {"answer_id": int(item_id)})
+                )
+            else:
+                await self._client.verify_comment_authorship(item_id)
+            await asyncio.to_thread(
+                self._deliveries.transition, delivery.event_id, delivery.sequence, "verified", item_id=item_id
+            )
+            return item_id
+        except Exception:
+            await asyncio.to_thread(
+                self._deliveries.transition, delivery.event_id, delivery.sequence, "uncertain"
+            )
+            raise
 
     async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
         """Expose Hermes's reply-completion boundary to durable event ingress."""
@@ -620,18 +722,36 @@ class BasecampAdapter(BasePlatformAdapter):
             chunks[-1] = chunks[-1] + markup
             message_id = ""
             for chunk in chunks:
-                result = (
-                    await self._client.post_chat(project_id, target_id, chunk)
-                    if target_type == "chat"
-                    else await self._client.post_comment(project_id, target_id, chunk)
-                )
-                message_id = str(result.get("id") or "")
-                if not message_id:
-                    raise BasecampRuntimeError("Basecamp media write lacked an item ID")
-                if target_type == "chat":
-                    await self._client.verify_chat_authorship(target_id, message_id)
+                event_id = self._active_dispatches.get(chat_id)
+                if event_id:
+                    sequence = self._delivery_sequences.get(event_id, 0)
+                    self._delivery_sequences[event_id] = sequence + 1
+                    delivery = await asyncio.to_thread(
+                        self._deliveries.reserve,
+                        event_id=event_id,
+                        sequence=sequence,
+                        chat_id=chat_id,
+                        target_type=target_type,
+                        project_id=project_id,
+                        target_id=target_id,
+                        content=chunk,
+                    )
+                    message_id = await self._deliver_reserved(
+                        delivery, reconcile_first=delivery.state != "reserved"
+                    )
                 else:
-                    await self._client.verify_comment_authorship(message_id)
+                    result = (
+                        await self._client.post_chat(project_id, target_id, chunk)
+                        if target_type == "chat"
+                        else await self._client.post_comment(project_id, target_id, chunk)
+                    )
+                    message_id = str(result.get("id") or "")
+                    if not message_id:
+                        raise BasecampRuntimeError("Basecamp media write lacked an item ID")
+                    if target_type == "chat":
+                        await self._client.verify_chat_authorship(target_id, message_id)
+                    else:
+                        await self._client.verify_comment_authorship(message_id)
             event_id = self._active_dispatches.get(chat_id)
             if event_id:
                 self._verified_deliveries.add(event_id)
@@ -703,6 +823,26 @@ class BasecampAdapter(BasePlatformAdapter):
             verified_items: list[dict[str, Any]] = []
             message_id = ""
             for chunk in format_chunks(content, max_length=MAX_MESSAGE_LENGTH):
+                event_id = self._active_dispatches.get(chat_id)
+                if event_id:
+                    sequence = self._delivery_sequences.get(event_id, 0)
+                    self._delivery_sequences[event_id] = sequence + 1
+                    delivery_target_type = "question" if self._target_types.get(chat_id) == "Question" else target_type
+                    delivery = await asyncio.to_thread(
+                        self._deliveries.reserve,
+                        event_id=event_id,
+                        sequence=sequence,
+                        chat_id=chat_id,
+                        target_type=delivery_target_type,
+                        project_id=project_id,
+                        target_id=target_id,
+                        content=chunk,
+                    )
+                    message_id = await self._deliver_reserved(
+                        delivery, reconcile_first=delivery.state != "reserved"
+                    )
+                    verified_items.append({"id": message_id})
+                    continue
                 if self._target_types.get(chat_id) == "Question":
                     result = await self._client.call(
                         "checkins", "create_answer", {"question_id": int(target_id), "content": chunk}

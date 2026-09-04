@@ -197,6 +197,9 @@ class CompositePoller:
             raise RuntimeError("All due Basecamp polling lanes failed")
         unique: dict[str, Mapping[str, Any]] = {}
         for (lane, _), batch in zip(tasks, batches, strict=True):
+            if self.inbox is not None and lane == "assignments":
+                self.inbox.accept_snapshot_batch("poll", "assignments", batch)
+                continue
             streams: dict[str, list[Mapping[str, Any]]] = {}
             for event in batch:
                 stream_id = str(event.get("_stream_id") or lane)
