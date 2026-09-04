@@ -19,16 +19,28 @@ class _MentionParser(HTMLParser):
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
         self.person_ids: set[str] = set()
+        self._mention_attachments = 0
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-        if tag.lower() != "bc-attachment":
-            return
+        tag = tag.lower()
         values = {name.lower(): value or "" for name, value in attrs}
+        if tag == "img" and self._mention_attachments:
+            person_id = values.get("data-avatar-for-person-id", "")
+            if person_id.isdigit():
+                self.person_ids.add(person_id)
+            return
+        if tag != "bc-attachment":
+            return
         if values.get("content-type", "").lower() != _MENTION_CONTENT_TYPE:
             return
+        self._mention_attachments += 1
         match = _PERSON_SGID.fullmatch(values.get("sgid", ""))
         if match:
             self.person_ids.add(match.group("person_id"))
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag.lower() == "bc-attachment" and self._mention_attachments:
+            self._mention_attachments -= 1
 
 
 @dataclass(frozen=True)

@@ -56,6 +56,19 @@ class EventModelTests(unittest.TestCase):
         }
         self.assertTrue(is_addressed_to(raw, person_id="123", mention="@HermesAgent"))
 
+    def test_signed_structured_mention_uses_nested_person_id(self):
+        raw = {
+            "recording": {
+                "content": (
+                    '<p><bc-attachment content-type="application/vnd.basecamp.mention" '
+                    'sgid="opaque-signed-global-id"><figure>'
+                    '<img data-avatar-for-person-id="123" alt="Hermes Agent">'
+                    "</figure></bc-attachment></p>"
+                )
+            }
+        }
+        self.assertTrue(is_addressed_to(raw, person_id="123", mention="@HermesAgent"))
+
     def test_plain_text_name_does_not_authorize(self):
         raw = {"recording": {"content": "Can @HermesAgent check this?"}}
         self.assertFalse(is_addressed_to(raw, person_id="123", mention="@HermesAgent"))
