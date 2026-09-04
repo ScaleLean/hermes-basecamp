@@ -1058,6 +1058,18 @@ def register(ctx) -> None:
             "Do not imply that you are a human colleague. Keep replies concise and contextual."
         ),
     )
+    if hasattr(ctx, "register_cli_command"):
+        try:
+            from .basecamp_cli import dispatch, register_cli
+        except ImportError:  # pragma: no cover - installed flat-module wheel
+            from basecamp_cli import dispatch, register_cli
+
+        ctx.register_cli_command(
+            name="basecamp",
+            help="Set up, diagnose, and test the Basecamp integration",
+            setup_fn=register_cli,
+            handler_fn=dispatch,
+        )
     if hasattr(ctx, "register_tool"):
         try:
             from .tools import register_tools

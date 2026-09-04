@@ -109,13 +109,17 @@ continuity.
 ## Operator commands
 
 ```sh
-hermes-basecamp setup --public-url https://agent.example.com/basecamp/webhooks/SECRET --yes
-hermes-basecamp doctor --probe
-hermes-basecamp webhooks sync --yes
-hermes-basecamp journal list
-hermes-basecamp journal reconcile --help
-hermes-basecamp test live --campfire-id ID --todolist-id ID --yes
+hermes basecamp setup --public-url https://agent.example.com/basecamp/webhooks/SECRET --yes
+hermes basecamp doctor --probe
+hermes basecamp webhooks sync --yes
+hermes basecamp journal list
+hermes basecamp journal reconcile --help
+hermes basecamp test live --campfire-id ID --todolist-id ID --yes
 ```
+
+Use Hermes's native profile selector for another agent, for example
+`hermes -p agentb basecamp doctor --probe`. The separately installed
+`hermes-basecamp` console script also accepts `--profile agentb`.
 
 `test live` requires separate conductor credentials. It does not use the
 agent's OAuth grant to create its own test event. Invitations, access changes,

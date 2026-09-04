@@ -147,8 +147,8 @@ class BasecampCLI:
         return data
 
 
-def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="hermes-basecamp")
+def register_cli(parser: argparse.ArgumentParser) -> None:
+    """Register commands for both `hermes basecamp` and the console script."""
     commands = parser.add_subparsers(dest="command", required=True)
     setup = commands.add_parser("setup", help="Verify identity and synchronize configured webhooks")
     setup.add_argument("--public-url")
@@ -183,6 +183,17 @@ def _parser() -> argparse.ArgumentParser:
     live.add_argument("--campfire-id", required=True)
     live.add_argument("--todolist-id", required=True)
     live.add_argument("--yes", action="store_true")
+    parser.set_defaults(func=dispatch)
+
+
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="hermes-basecamp")
+    parser.add_argument(
+        "-p",
+        "--profile",
+        help="Hermes profile name. Prefer `hermes -p NAME basecamp ...` when available.",
+    )
+    register_cli(parser)
     return parser
 
 
@@ -281,8 +292,29 @@ async def _main_async(args: argparse.Namespace) -> int:
         await client.close()
 
 
+def dispatch(args: argparse.Namespace) -> int:
+    return asyncio.run(_main_async(args))
+
+
+def _load_standalone_profile(profile: str | None) -> Path:
+    """Load the same profile-scoped environment that the Hermes CLI uses."""
+    if profile:
+        from hermes_cli.profiles import resolve_profile_env
+
+        home = Path(resolve_profile_env(profile))
+    else:
+        home = Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes").expanduser()
+    os.environ["HERMES_HOME"] = str(home)
+    from hermes_cli.env_loader import load_hermes_dotenv
+
+    load_hermes_dotenv(hermes_home=home)
+    return home
+
+
 def main() -> int:
-    return asyncio.run(_main_async(_parser().parse_args()))
+    args = _parser().parse_args()
+    _load_standalone_profile(args.profile)
+    return dispatch(args)
 
 
 if __name__ == "__main__":

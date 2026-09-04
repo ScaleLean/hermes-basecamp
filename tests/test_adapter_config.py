@@ -50,6 +50,9 @@ class AdapterConfigTests(unittest.TestCase):
             def register_platform(self, **kwargs):
                 self.platform = kwargs
 
+            def register_cli_command(self, **kwargs):
+                self.cli_command = kwargs
+
             def register_tool(self, **kwargs):
                 pass
 
@@ -59,10 +62,12 @@ class AdapterConfigTests(unittest.TestCase):
         from basecamp_plugin.adapter import register
 
         set_multiplex_active(True)
+        context = Context()
         try:
-            register(Context())
+            register(context)
         finally:
             set_multiplex_active(False)
+        self.assertEqual(context.cli_command["name"], "basecamp")
 
     def test_parses_prefixed_recording_target(self):
         self.assertEqual(
