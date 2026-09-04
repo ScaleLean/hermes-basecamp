@@ -136,8 +136,7 @@ python -m pytest -p no:cacheprovider -q
 ruff check .
 mypy --explicit-package-bases .
 python scripts/generate_sdk_routes.py --check
-python scripts/scan_secrets.py
-python scripts/scan_secrets.py --history
+gitleaks detect --source . --redact --no-banner
 python -m build
 hermes plugins doctor . --ci
 ```

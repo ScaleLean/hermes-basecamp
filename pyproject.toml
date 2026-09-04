@@ -26,7 +26,7 @@ dev = ["build>=1.2", "pytest>=8", "pytest-asyncio>=0.24", "ruff>=0.4", "mypy>=1.
 hermes-basecamp = "basecamp_cli:main"
 
 [tool.hatch.build.targets.wheel]
-include = ["adapter.py", "approval.py", "basecamp_cli.py", "delivery_journal.py", "event_model.py", "formatter.py", "health.py", "inbox.py", "journal.py", "launchpad_oauth.py", "live_test.py", "media.py", "oauth_onboarding.py", "oauth_store.py", "onboarding.py", "operations.py", "policy.py", "poller.py", "replay_store.py", "resource_index.py", "sdk_client.py", "sdk_inventory.py", "sdk_routes.py", "tools.py", "trusted_context.py", "verification.py", "webhook_ingress.py", "webhook_reconciliation.py", "plugin.yaml", "scripts/_plugin_loader.py", "scripts/basecamp_canary.py", "scripts/basecamp_doctor.py", "scripts/basecamp_oauth.py", "scripts/basecamp_launchpad_oauth.py", "scripts/generate_sdk_routes.py", "scripts/scan_secrets.py"]
+include = ["adapter.py", "approval.py", "basecamp_cli.py", "delivery_journal.py", "event_model.py", "formatter.py", "health.py", "inbox.py", "journal.py", "launchpad_oauth.py", "live_test.py", "media.py", "oauth_onboarding.py", "oauth_store.py", "onboarding.py", "operations.py", "policy.py", "poller.py", "replay_store.py", "resource_index.py", "sdk_client.py", "sdk_inventory.py", "sdk_routes.py", "tools.py", "trusted_context.py", "verification.py", "webhook_ingress.py", "webhook_reconciliation.py", "plugin.yaml", "scripts/_plugin_loader.py", "scripts/basecamp_canary.py", "scripts/basecamp_doctor.py", "scripts/basecamp_oauth.py", "scripts/basecamp_launchpad_oauth.py", "scripts/generate_sdk_routes.py"]
 
 [tool.mypy]
 python_version = "3.11"
