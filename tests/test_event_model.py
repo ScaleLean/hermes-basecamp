@@ -33,6 +33,20 @@ class EventModelTests(unittest.TestCase):
         )
         self.assertEqual(event.chat_id, "bucket:22/recording:44")
 
+    def test_normalizes_todo_to_itself_not_its_todolist(self):
+        event = normalize_event(
+            {
+                "id": 77,
+                "kind": "todo_created",
+                "creator": {"id": 11, "name": "Human User"},
+                "bucket": {"id": 22},
+                "recording": {"id": 33, "type": "Todo", "title": "Do the work"},
+                "parent": {"id": 44, "type": "Todolist"},
+            }
+        )
+
+        self.assertEqual(event.chat_id, "bucket:22/recording:33")
+
     def test_rejects_incomplete_events(self):
         self.assertIsNone(normalize_event({"id": 1}))
 
@@ -87,8 +101,32 @@ class EventModelTests(unittest.TestCase):
         self.assertFalse(is_addressed_to(raw, person_id="123", mention="@HermesAgent"))
 
     def test_explicit_assignment_is_addressed(self):
-        raw = {"recording": {"assignees": [{"id": 123}]}}
+        raw = {"kind": "assignment_created", "recording": {"assignees": [{"id": 123}]}}
         self.assertTrue(is_addressed_to(raw, person_id="123", mention="@HermesAgent"))
+
+    def test_assigned_todo_creation_waits_for_assignment_snapshot(self):
+        raw = {
+            "kind": "todo_created",
+            "recording": {"id": 33, "type": "Todo", "assignees": [{"id": 123}]},
+        }
+
+        self.assertFalse(is_addressed_to(raw, person_id="123", mention="@HermesAgent"))
+
+    def test_active_todo_mutation_is_not_a_follow_up(self):
+        raw = {
+            "kind": "todo_assignment_changed",
+            "creator": {"id": 789, "client": False},
+            "recording": {"id": 33, "type": "Todo", "assignees": [{"id": 123}]},
+        }
+
+        self.assertFalse(
+            is_eligible_for_agent(
+                raw,
+                person_id="123",
+                mention="@HermesAgent",
+                active=True,
+            )
+        )
 
     def test_ambient_activity_is_not_addressed(self):
         raw = {"recording": {"content": "General project update"}}
@@ -159,6 +197,7 @@ class EventModelTests(unittest.TestCase):
 
     def test_peer_agent_assignment_is_an_explicit_trigger(self):
         raw = {
+            "kind": "assignment_created",
             "creator": {"id": 456, "client": False},
             "bucket": {"id": 10},
             "recording": {"id": 92, "type": "Todo", "assignees": [{"id": 123}]},

@@ -15,6 +15,90 @@ from webhook_ingress import DurableWebhookStore, WebhookIngress
 
 
 class AdapterRuntimeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_one_todo_assignment_dispatches_once_across_activity_and_snapshot_lanes(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            canonical = {
+                "id": 49,
+                "type": "Todo",
+                "title": "Assignment canary",
+                "creator": {"id": 8, "name": "Peer Agent", "client": False},
+                "assignees": [{"id": 7}],
+                "bucket": {"id": 10},
+                "parent": {"id": 30, "type": "Todolist"},
+            }
+            client = SimpleNamespace(
+                project_ids=("10",),
+                expected=SimpleNamespace(account_id="1", person_id="7"),
+                fetch_recording=AsyncMock(return_value=canonical),
+                call=AsyncMock(return_value={"id": 49, "completed": True, "bucket": {"id": 10}}),
+            )
+            config = PlatformConfig(
+                extra={
+                    "account_id": "1",
+                    "person_id": "7",
+                    "person_email": "agent@example.com",
+                    "mention": "@agent",
+                    "project_ids": ["10"],
+                    "peer_agent_ids": ["8"],
+                    "access_token": "test",
+                }
+            )
+            with (
+                patch("adapter._make_client", return_value=client),
+                patch("adapter.default_replay_path", return_value=root / "replay.json"),
+                patch("adapter.configured_media_roots", return_value=(root,)),
+                patch("adapter.configured_inbound_media_root", return_value=root),
+                patch("adapter.Platform", return_value=next(iter(Platform))),
+            ):
+                adapter = BasecampAdapter(config)
+            adapter._bootstrapped = True
+            adapter._poller.collect = AsyncMock(
+                return_value=[
+                    {
+                        "id": 81,
+                        "kind": "todo_created",
+                        "created_at": "2026-09-04T01:00:00Z",
+                        "creator": canonical["creator"],
+                        "bucket": canonical["bucket"],
+                        "recording": canonical,
+                        "parent": canonical["parent"],
+                    },
+                    {
+                        "id": 82,
+                        "kind": "todo_assignment_changed",
+                        "created_at": "2026-09-04T01:00:01Z",
+                        "creator": canonical["creator"],
+                        "bucket": canonical["bucket"],
+                        "recording": canonical,
+                        "parent": canonical["parent"],
+                    },
+                    {
+                        "id": "assignment:49",
+                        "kind": "assignment_created",
+                        "created_at": "2026-09-04T01:00:02Z",
+                        "creator": canonical["creator"],
+                        "bucket": canonical["bucket"],
+                        "recording": canonical,
+                    },
+                ]
+            )
+
+            async def complete(event):
+                adapter._inbox.activate("10", "49")
+                adapter._verified_deliveries.add(str(event.message_id))
+                await adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
+
+            adapter.handle_message = AsyncMock(side_effect=complete)
+
+            await adapter._poll_once()
+
+            adapter.handle_message.assert_awaited_once()
+            event = adapter.handle_message.await_args.args[0]
+            self.assertEqual(event.message_id, "assignment:49")
+            self.assertEqual(event.source.chat_id, "bucket:10/recording:49")
+            self.assertEqual(adapter._inbox.stats()["depth"], 0)
+
     async def test_peer_agent_reply_does_not_dispatch_on_active_campfire(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

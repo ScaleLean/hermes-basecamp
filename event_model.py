@@ -109,7 +109,7 @@ def normalize_event(raw: Mapping[str, Any]) -> NormalizedEvent | None:
         target_id = parent_id or recording_id
         chat_id = f"bucket:{project_id}/recording:{target_id}"
     else:
-        target_id = parent_id or recording_id
+        target_id = parent_id if record_type == "Comment" and parent_id else recording_id
         chat_id = f"bucket:{project_id}/recording:{target_id}"
 
     created = raw.get("created_at") or raw.get("createdAt")
@@ -140,11 +140,12 @@ def is_explicitly_addressed_to(raw: Mapping[str, Any], *, person_id: str) -> boo
     notification_section = str(raw.get("_notification_section") or "").lower()
     if notification_section == "mentions":
         return True
-    assignees = recording.get("assignees") or raw.get("assignees") or []
-    if isinstance(assignees, list):
-        for assignee in assignees:
-            if _identifier(assignee) == person_id:
-                return True
+    if str(raw.get("kind") or "") == "assignment_created":
+        assignees = recording.get("assignees") or raw.get("assignees") or []
+        if isinstance(assignees, list):
+            for assignee in assignees:
+                if _identifier(assignee) == person_id:
+                    return True
 
     return any(
         person_id in _mentioned_person_ids(value)
@@ -193,7 +194,10 @@ def is_eligible_for_agent(
         return False
     if creator_id in peer_agent_ids:
         return is_explicitly_addressed_to(raw, person_id=person_id)
-    return is_addressed_to(raw, person_id=person_id, mention=mention) or active
+    recording = raw.get("recording") or raw.get("recordable") or {}
+    recording_type = str(recording.get("type") or "") if isinstance(recording, Mapping) else ""
+    is_follow_up = active and recording_type in {"Chat::Line", "Comment"}
+    return is_addressed_to(raw, person_id=person_id, mention=mention) or is_follow_up
 
 
 def parse_target(chat_id: str) -> tuple[str, str, str]:
