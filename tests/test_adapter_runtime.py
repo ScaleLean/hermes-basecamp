@@ -275,11 +275,14 @@ class AdapterRuntimeTests(unittest.IsolatedAsyncioTestCase):
 
             adapter.send = AsyncMock(side_effect=verified_send)
             task = asyncio.create_task(adapter._poll_once())
-            for _ in range(20):
-                await asyncio.sleep(0.01)
-                if adapter._replay.path.exists():
-                    break
-            state = json.loads(adapter._replay.path.read_text())
+            async with asyncio.timeout(2):
+                while not adapter._replay.path.exists():
+                    await asyncio.sleep(0.01)
+                while True:
+                    state = json.loads(adapter._replay.path.read_text())
+                    if "9" in state["pending"]:
+                        break
+                    await asyncio.sleep(0.01)
             self.assertIn("9", state["pending"])
             self.assertNotIn("9", state["committed"])
             delivered.set()
