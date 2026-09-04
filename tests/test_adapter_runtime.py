@@ -90,6 +90,7 @@ class AdapterRuntimeTests(unittest.IsolatedAsyncioTestCase):
             )
 
             async def complete(event):
+                adapter._verified_deliveries.add(str(event.message_id))
                 await adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
 
             adapter.handle_message = AsyncMock(side_effect=complete)
@@ -142,6 +143,7 @@ class AdapterRuntimeTests(unittest.IsolatedAsyncioTestCase):
             client.fetch_recording = AsyncMock(side_effect=[RuntimeError("poison"), raw(2)["recording"]])
 
             async def complete(event):
+                adapter._verified_deliveries.add(str(event.message_id))
                 await adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
 
             adapter.handle_message = AsyncMock(side_effect=complete)
@@ -198,7 +200,12 @@ class AdapterRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 return "completed reply"
 
             adapter._message_handler = delayed_handler
-            adapter.send = AsyncMock(return_value=SendResult(success=True, message_id="reply-1"))
+
+            async def verified_send(chat_id, *_args, **_kwargs):
+                adapter._verified_deliveries.add(adapter._active_dispatches[chat_id])
+                return SendResult(success=True, message_id="reply-1")
+
+            adapter.send = AsyncMock(side_effect=verified_send)
             task = asyncio.create_task(adapter._poll_once())
             for _ in range(20):
                 await asyncio.sleep(0.01)
@@ -228,6 +235,8 @@ class AdapterRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 expected=SimpleNamespace(account_id="1", person_id="7"),
                 fetch_recording=AsyncMock(return_value=canonical),
                 call=AsyncMock(return_value={"id": 49, "completed": True, "bucket": {"id": 10}}),
+                post_comment=AsyncMock(return_value={"id": 90}),
+                verify_comment_authorship=AsyncMock(return_value={"id": 90, "creator": {"id": 7}}),
             )
             config = PlatformConfig(
                 extra={
@@ -259,17 +268,31 @@ class AdapterRuntimeTests(unittest.IsolatedAsyncioTestCase):
                     }
                 ]
             )
-            seen_user_ids = []
+            seen_sources = []
 
             async def handle(event):
-                seen_user_ids.append(event.user_id)
+                seen_sources.append(event.source)
+                adapter._verified_deliveries.add(str(event.message_id))
                 await adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
 
             adapter.handle_message = AsyncMock(side_effect=handle)
 
             await adapter._poll_once()
 
-            self.assertEqual(seen_user_ids, ["8"])
+            self.assertEqual([source.user_id for source in seen_sources], ["8"])
+            self.assertTrue(seen_sources[0].role_authorized)
+
+            client.call.reset_mock()
+            adapter._poller.collect.return_value[0]["id"] = "assignment:49:no-reply"
+
+            async def no_reply(event):
+                await adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
+
+            adapter.handle_message.side_effect = no_reply
+            await adapter._poll_once()
+
+            client.call.assert_not_awaited()
+            client.post_comment.assert_awaited_once()
 
     async def test_native_media_send_uses_attachment_markup_and_verified_target(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -463,6 +486,7 @@ class AdapterRuntimeTests(unittest.IsolatedAsyncioTestCase):
             )
 
             async def complete(event):
+                adapter._verified_deliveries.add(str(event.message_id))
                 await adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
 
             adapter.handle_message = AsyncMock(side_effect=complete)

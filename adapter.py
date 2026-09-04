@@ -185,6 +185,8 @@ class BasecampAdapter(BasePlatformAdapter):
         self._media_roots = configured_media_roots()
         self._inbound_media_root = configured_inbound_media_root(values["account_id"], values["person_id"])
         self._processing_waiters: dict[str, asyncio.Future[ProcessingOutcome]] = {}
+        self._active_dispatches: dict[str, str] = {}
+        self._verified_deliveries: set[str] = set()
         self._chat_transcripts: dict[str, str] = {}
         self._target_types: dict[str, str] = {}
         self._poll_seconds = 10
@@ -417,6 +419,10 @@ class BasecampAdapter(BasePlatformAdapter):
                     user_name=verified.person_name,
                     scope_id=self._client.expected.account_id,
                     message_id=verified.event_id,
+                    role_authorized=(
+                        isinstance(canonical_creator, Mapping)
+                        and canonical_creator.get("client") is False
+                    ),
                 )
                 received_media = await self._receive_media(canonical)
                 message_event = MessageEvent(
@@ -440,6 +446,7 @@ class BasecampAdapter(BasePlatformAdapter):
                 )
                 completion = asyncio.get_running_loop().create_future()
                 self._processing_waiters[verified.event_id] = completion
+                self._active_dispatches[verified.chat_id] = verified.event_id
                 is_assignment = verified.kind == "assignment_created"
                 acknowledgement = asyncio.create_task(
                     self._acknowledge_later(verified, 60.0 if is_assignment else 25.0)
@@ -449,13 +456,17 @@ class BasecampAdapter(BasePlatformAdapter):
                     outcome = await asyncio.shield(completion)
                 finally:
                     self._processing_waiters.pop(verified.event_id, None)
+                    if self._active_dispatches.get(verified.chat_id) == verified.event_id:
+                        self._active_dispatches.pop(verified.chat_id, None)
                     if acknowledgement:
                         acknowledgement.cancel()
                         try:
                             await acknowledgement
                         except asyncio.CancelledError:
                             pass
-                if outcome is not ProcessingOutcome.SUCCESS:
+                delivery_verified = verified.event_id in self._verified_deliveries
+                self._verified_deliveries.discard(verified.event_id)
+                if outcome is not ProcessingOutcome.SUCCESS or not delivery_verified:
                     if is_assignment:
                         await self._post_assignment_status(
                             verified, "I could not complete this work. The assigned item remains open."
@@ -582,6 +593,9 @@ class BasecampAdapter(BasePlatformAdapter):
                     await self._client.verify_chat_authorship(target_id, message_id)
                 else:
                     await self._client.verify_comment_authorship(message_id)
+            event_id = self._active_dispatches.get(chat_id)
+            if event_id:
+                self._verified_deliveries.add(event_id)
             return SendResult(success=True, message_id=message_id)
         except Exception as exc:
             return SendResult(success=False, error=str(exc))
@@ -672,6 +686,9 @@ class BasecampAdapter(BasePlatformAdapter):
                     )
                 verified_items.append(dict(verified))
             await asyncio.to_thread(self._inbox.activate, project_id, target_id)
+            event_id = self._active_dispatches.get(chat_id)
+            if event_id:
+                self._verified_deliveries.add(event_id)
             return SendResult(success=True, message_id=message_id, raw_response={"items": verified_items})
         except Exception as exc:
             return SendResult(success=False, error=str(exc))
