@@ -32,6 +32,30 @@ class DurableInboxTests(unittest.TestCase):
             self.assertIsNotNone(inbox.claim())
             self.assertIsNone(inbox.claim())
 
+    def test_campfire_line_and_mention_notification_share_one_identity(self):
+        with tempfile.TemporaryDirectory() as temp:
+            inbox = DurableInbox(Path(temp) / "inbox.sqlite3")
+            line = {
+                "id": 40,
+                "created_at": "2026-09-04T01:00:00.000Z",
+                "creator": {"id": 8},
+                "bucket": {"id": 10},
+                "recording": {"id": 40, "type": "Chat::Line"},
+            }
+            notification = {
+                "id": 900,
+                "created_at": "2026-09-04T01:00:00.123Z",
+                "creator": {"id": 8},
+                "bucket": {"id": 10},
+                "recording": {"id": 40, "type": "Chat::Line"},
+                "_notification_section": "mentions",
+            }
+
+            self.assertEqual(inbox.accept_batch("poll", "campfire:10:30", [line]), 1)
+            self.assertEqual(inbox.accept_batch("poll", "notifications", [notification]), 0)
+            self.assertIsNotNone(inbox.claim())
+            self.assertIsNone(inbox.claim())
+
     def test_expired_lease_recovers_after_restart(self):
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "inbox.sqlite3"

@@ -29,6 +29,9 @@ def event_identity(payload: Mapping[str, Any]) -> str:
     event_id = str(payload.get("id") or payload.get("event_id") or "")
     recording = payload.get("recording") or payload.get("recordable") or payload
     recording_id = str(recording.get("id") or "") if isinstance(recording, Mapping) else ""
+    recording_type = str(recording.get("type") or "") if isinstance(recording, Mapping) else ""
+    if recording_type == "Chat::Line" and recording_id:
+        return f"recording:{recording_type}:{recording_id}"
     version = str(
         payload.get("updated_at")
         or payload.get("created_at")
