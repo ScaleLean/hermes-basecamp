@@ -341,6 +341,9 @@ class BasecampAdapter(BasePlatformAdapter):
                 await asyncio.to_thread(
                     self._inbox.accept_batch, "webhook", "webhook:compatibility", [webhook_event]
                 )
+        runner = getattr(self, "gateway_runner", None)
+        if runner is not None and getattr(runner, "_startup_restore_in_progress", False):
+            return
         while len(events) < 100:
             claimed = await asyncio.to_thread(self._inbox.claim)
             if claimed is None:

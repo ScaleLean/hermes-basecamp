@@ -101,6 +101,50 @@ class AdapterRuntimeTests(unittest.IsolatedAsyncioTestCase):
             adapter.handle_message.assert_not_awaited()
             client.fetch_recording.assert_not_awaited()
 
+    async def test_startup_restore_keeps_events_in_inbox_without_dispatch(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            client = SimpleNamespace(
+                project_ids=("10",),
+                expected=SimpleNamespace(account_id="1", person_id="7"),
+            )
+            config = PlatformConfig(
+                extra={
+                    "account_id": "1",
+                    "person_id": "7",
+                    "person_email": "agent@example.com",
+                    "mention": "@agent",
+                    "project_ids": ["10"],
+                    "access_token": "test",
+                }
+            )
+            with (
+                patch("adapter._make_client", return_value=client),
+                patch("adapter.default_replay_path", return_value=root / "replay.json"),
+                patch("adapter.configured_media_roots", return_value=(root,)),
+                patch("adapter.configured_inbound_media_root", return_value=root),
+                patch("adapter.Platform", return_value=next(iter(Platform))),
+            ):
+                adapter = BasecampAdapter(config)
+            adapter._bootstrapped = True
+            adapter.gateway_runner = SimpleNamespace(_startup_restore_in_progress=True)
+            adapter._poller.collect = AsyncMock(
+                return_value=[
+                    {
+                        "id": 12,
+                        "creator": {"id": 8},
+                        "bucket": {"id": 10},
+                        "recording": {"id": 49, "type": "Todo", "assignees": [{"id": 7}]},
+                    }
+                ]
+            )
+            adapter.handle_message = AsyncMock()
+
+            await adapter._poll_once()
+
+            adapter.handle_message.assert_not_awaited()
+            self.assertEqual(adapter._inbox.stats()["depth"], 1)
+
     async def test_poison_event_does_not_abort_later_event(self):
         with tempfile.TemporaryDirectory() as temp:
             client = SimpleNamespace(
