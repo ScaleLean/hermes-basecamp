@@ -42,7 +42,7 @@ class _Client:
             for values in self.existing.values():
                 for item in values:
                     if item["id"] == arguments["webhook_id"]:
-                        return item
+                        return {key: value for key, value in item.items() if key != "bucket"}
         raise AssertionError((service, method, arguments))
 
 
