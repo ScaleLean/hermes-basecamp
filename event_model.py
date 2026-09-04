@@ -132,8 +132,33 @@ def normalize_event(raw: Mapping[str, Any]) -> NormalizedEvent | None:
     )
 
 
+def is_explicitly_addressed_to(raw: Mapping[str, Any], *, person_id: str) -> bool:
+    """Return true for a Basecamp-authenticated mention or assignment."""
+    recording = raw.get("recording") or raw.get("recordable") or {}
+    if not isinstance(recording, Mapping):
+        recording = {}
+    notification_section = str(raw.get("_notification_section") or "").lower()
+    if notification_section == "mentions":
+        return True
+    assignees = recording.get("assignees") or raw.get("assignees") or []
+    if isinstance(assignees, list):
+        for assignee in assignees:
+            if _identifier(assignee) == person_id:
+                return True
+
+    return any(
+        person_id in _mentioned_person_ids(value)
+        for value in (
+            recording.get("content"),
+            recording.get("title"),
+            raw.get("summary"),
+            raw.get("description"),
+        )
+    )
+
+
 def is_addressed_to(raw: Mapping[str, Any], *, person_id: str, mention: str) -> bool:
-    """Return true only for a structured Basecamp mention or assignment."""
+    """Return true for a trusted direct Basecamp interaction."""
     recording = raw.get("recording") or raw.get("recordable") or {}
     if not isinstance(recording, Mapping):
         recording = {}
@@ -146,26 +171,29 @@ def is_addressed_to(raw: Mapping[str, Any], *, person_id: str, mention: str) -> 
     ):
         return creator.get("client") is False
     notification_section = str(raw.get("_notification_section") or "").lower()
-    if notification_section == "mentions":
-        return True
     if notification_section == "inbox" and str(recording.get("type") or "") == "Question":
         return True
-    assignees = recording.get("assignees") or raw.get("assignees") or []
-    if isinstance(assignees, list):
-        for assignee in assignees:
-            if _identifier(assignee) == person_id:
-                return True
 
     del mention  # Display-only configuration. Authorization uses the person SGID.
-    return any(
-        person_id in _mentioned_person_ids(value)
-        for value in (
-            recording.get("content"),
-            recording.get("title"),
-            raw.get("summary"),
-            raw.get("description"),
-        )
-    )
+    return is_explicitly_addressed_to(raw, person_id=person_id)
+
+
+def is_eligible_for_agent(
+    raw: Mapping[str, Any],
+    *,
+    person_id: str,
+    mention: str,
+    peer_agent_ids: tuple[str, ...] = (),
+    active: bool = False,
+) -> bool:
+    """Apply self-event, peer-agent, direct-address, and follow-up policy."""
+    creator = raw.get("creator") or raw.get("person") or {}
+    creator_id = _identifier(creator)
+    if creator_id == person_id:
+        return False
+    if creator_id in peer_agent_ids:
+        return is_explicitly_addressed_to(raw, person_id=person_id)
+    return is_addressed_to(raw, person_id=person_id, mention=mention) or active
 
 
 def parse_target(chat_id: str) -> tuple[str, str, str]:

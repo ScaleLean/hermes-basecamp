@@ -103,6 +103,10 @@ optional_env:
     description: "Allow any Basecamp member to trigger Hermes"
     prompt: "Allow all Basecamp members?"
     password: false
+  - name: BASECAMP_PEER_AGENT_IDS
+    description: "Comma-separated Basecamp person IDs for other agent members; their implicit follow-ups are ignored"
+    prompt: "Peer Basecamp agent person IDs"
+    password: false
   - name: BASECAMP_STATE_DIR
     description: "Owner-only directory for durable cursors, replay state, and operation journals"
     prompt: "Basecamp state directory"

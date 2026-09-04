@@ -1,6 +1,6 @@
 import unittest
 
-from event_model import is_addressed_to, normalize_event, parse_target
+from event_model import is_addressed_to, is_eligible_for_agent, normalize_event, parse_target
 
 
 class EventModelTests(unittest.TestCase):
@@ -115,6 +115,122 @@ class EventModelTests(unittest.TestCase):
             "recording": {"id": 92, "type": "Chat::Line", "content": "Hello"},
         }
         self.assertFalse(is_addressed_to(raw, person_id="123", mention="@HermesAgent"))
+
+    def test_peer_agent_reply_cannot_continue_an_active_campfire(self):
+        raw = {
+            "creator": {"id": 456, "client": False},
+            "bucket": {"id": 10},
+            "recording": {"id": 92, "type": "Chat::Line", "content": "Received."},
+        }
+
+        self.assertFalse(
+            is_eligible_for_agent(
+                raw,
+                person_id="123",
+                mention="@HermesAgent",
+                peer_agent_ids=("456",),
+                active=True,
+            )
+        )
+
+    def test_peer_agent_structured_mention_is_an_explicit_trigger(self):
+        raw = {
+            "creator": {"id": 456, "client": False},
+            "bucket": {"id": 10},
+            "recording": {
+                "id": 92,
+                "type": "Chat::Line",
+                "content": (
+                    '<bc-attachment content-type="application/vnd.basecamp.mention" '
+                    'sgid="sgid://bc3/Person/123"></bc-attachment> Please take this.'
+                ),
+            },
+        }
+
+        self.assertTrue(
+            is_eligible_for_agent(
+                raw,
+                person_id="123",
+                mention="@HermesAgent",
+                peer_agent_ids=("456",),
+                active=True,
+            )
+        )
+
+    def test_peer_agent_assignment_is_an_explicit_trigger(self):
+        raw = {
+            "creator": {"id": 456, "client": False},
+            "bucket": {"id": 10},
+            "recording": {"id": 92, "type": "Todo", "assignees": [{"id": 123}]},
+        }
+
+        self.assertTrue(
+            is_eligible_for_agent(
+                raw,
+                person_id="123",
+                mention="@HermesAgent",
+                peer_agent_ids=("456",),
+                active=False,
+            )
+        )
+
+    def test_peer_agent_ping_line_is_not_an_automatic_trigger(self):
+        raw = {
+            "creator": {"id": 456, "client": False},
+            "bucket": {"id": 55, "type": "Circle"},
+            "recording": {"id": 92, "type": "Chat::Line", "content": "Reply"},
+        }
+
+        self.assertFalse(
+            is_eligible_for_agent(
+                raw,
+                person_id="123",
+                mention="@HermesAgent",
+                peer_agent_ids=("456",),
+                active=False,
+            )
+        )
+
+    def test_human_follow_up_remains_eligible_on_an_active_recording(self):
+        raw = {
+            "creator": {"id": 789, "client": False},
+            "bucket": {"id": 10},
+            "recording": {"id": 92, "type": "Chat::Line", "content": "One more question."},
+        }
+
+        self.assertTrue(
+            is_eligible_for_agent(
+                raw,
+                person_id="123",
+                mention="@HermesAgent",
+                peer_agent_ids=("456",),
+                active=True,
+            )
+        )
+
+    def test_self_authored_event_is_never_eligible(self):
+        raw = {
+            "creator": {"id": 123, "client": False},
+            "bucket": {"id": 10},
+            "recording": {
+                "id": 92,
+                "type": "Chat::Line",
+                "content": (
+                    '<bc-attachment content-type="application/vnd.basecamp.mention" '
+                    'sgid="sgid://bc3/Person/123"></bc-attachment>'
+                ),
+            },
+        }
+
+        self.assertFalse(
+            is_eligible_for_agent(
+                raw,
+                person_id="123",
+                mention="@HermesAgent",
+                peer_agent_ids=("456",),
+                active=True,
+            )
+        )
 
     def test_official_target_grammar(self):
         self.assertEqual(parse_target("recording:44"), ("recording", "", "44"))

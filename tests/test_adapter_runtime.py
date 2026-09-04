@@ -15,6 +15,62 @@ from webhook_ingress import DurableWebhookStore, WebhookIngress
 
 
 class AdapterRuntimeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_peer_agent_reply_does_not_dispatch_on_active_campfire(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            canonical = {
+                "id": 49,
+                "type": "Chat::Line",
+                "content": "I received the canary.",
+                "creator": {"id": 8, "name": "Peer Agent", "client": False},
+                "bucket": {"id": 10},
+            }
+            client = SimpleNamespace(
+                project_ids=("10",),
+                expected=SimpleNamespace(account_id="1", person_id="7"),
+                fetch_recording=AsyncMock(return_value=canonical),
+            )
+            config = PlatformConfig(
+                extra={
+                    "account_id": "1",
+                    "person_id": "7",
+                    "person_email": "agent@example.com",
+                    "mention": "@agent",
+                    "project_ids": ["10"],
+                    "peer_agent_ids": ["8"],
+                    "access_token": "test",
+                }
+            )
+            with (
+                patch("adapter._make_client", return_value=client),
+                patch("adapter.default_replay_path", return_value=root / "replay.json"),
+                patch("adapter.configured_media_roots", return_value=(root,)),
+                patch("adapter.configured_inbound_media_root", return_value=root),
+                patch("adapter.Platform", return_value=next(iter(Platform))),
+            ):
+                adapter = BasecampAdapter(config)
+            adapter._bootstrapped = True
+            adapter._inbox.activate("10", "30")
+            adapter._poller.collect = AsyncMock(
+                return_value=[
+                    {
+                        "id": 91,
+                        "kind": "chat_line_created",
+                        "created_at": "2026-09-04T01:00:00Z",
+                        "creator": {"id": 8, "name": "Peer Agent", "client": False},
+                        "bucket": {"id": 10},
+                        "recording": {"id": 49, "type": "Chat::Line", "content": "I received the canary."},
+                        "parent": {"id": 30, "type": "Chat::Transcript"},
+                    }
+                ]
+            )
+            adapter.handle_message = AsyncMock()
+
+            await adapter._poll_once()
+
+            adapter.handle_message.assert_not_awaited()
+            self.assertEqual(adapter._inbox.stats()["depth"], 0)
+
     async def test_uncertain_reply_reconciles_without_a_second_write(self):
         with tempfile.TemporaryDirectory() as temp:
             adapter = object.__new__(BasecampAdapter)

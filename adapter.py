@@ -23,7 +23,7 @@ from gateway.platforms.base import (
 
 try:
     from .delivery_journal import Delivery, DeliveryJournal
-    from .event_model import is_addressed_to, normalize_event, parse_target
+    from .event_model import is_eligible_for_agent, normalize_event, parse_target
     from .formatter import format_chunks
     from .inbox import DurableInbox
     from .media import MediaManager, configured_inbound_media_root, configured_media_roots, find_attachments
@@ -41,7 +41,7 @@ try:
     from .webhook_ingress import WebhookHTTPReceiver, WebhookIngress
 except ImportError:  # pragma: no cover - installed flat-module wheel
     from delivery_journal import Delivery, DeliveryJournal
-    from event_model import is_addressed_to, normalize_event, parse_target
+    from event_model import is_eligible_for_agent, normalize_event, parse_target
     from formatter import format_chunks
     from inbox import DurableInbox
     from media import MediaManager, configured_inbound_media_root, configured_media_roots, find_attachments
@@ -93,6 +93,7 @@ def _settings(config: PlatformConfig | None = None) -> dict[str, Any]:
         "person_email": str(configured("person_email", "BASECAMP_PERSON_EMAIL")),
         "mention": str(configured("mention", "BASECAMP_AGENT_MENTION")),
         "project_ids": _project_ids(configured("project_ids", "BASECAMP_PROJECT_IDS")),
+        "peer_agent_ids": _project_ids(configured("peer_agent_ids", "BASECAMP_PEER_AGENT_IDS")),
         "access_token": str(configured("access_token", "BASECAMP_ACCESS_TOKEN")),
         "token_file": str(configured("token_file", "BASECAMP_OAUTH_TOKEN_FILE")),
         "refresh_token": str(configured("refresh_token", "BASECAMP_REFRESH_TOKEN")),
@@ -185,6 +186,7 @@ class BasecampAdapter(BasePlatformAdapter):
             )
         self._client = _make_client(values)
         self._mention = values["mention"]
+        self._peer_agent_ids = values["peer_agent_ids"]
         self._media_roots = configured_media_roots()
         self._inbound_media_root = configured_inbound_media_root(values["account_id"], values["person_id"])
         self._processing_waiters: dict[str, asyncio.Future[ProcessingOutcome]] = {}
@@ -439,15 +441,22 @@ class BasecampAdapter(BasePlatformAdapter):
                 if isinstance(canonical_creator, Mapping) and canonical_creator.get("id"):
                     verified_raw["creator"] = canonical_creator
                 verified = normalize_event(verified_raw)
+                active_recording = bool(
+                    verified
+                    and await asyncio.to_thread(
+                        self._inbox.is_active, verified.project_id, verified.recording_id
+                    )
+                )
                 if (
                     not verified
                     or verified.person_id == self._client.expected.person_id
                     or (not is_ping and verified.project_id not in self._client.project_ids)
-                    or not (
-                        is_addressed_to(verified_raw, person_id=self._client.expected.person_id, mention=self._mention)
-                        or await asyncio.to_thread(
-                            self._inbox.is_active, verified.project_id, verified.recording_id
-                        )
+                    or not is_eligible_for_agent(
+                        verified_raw,
+                        person_id=self._client.expected.person_id,
+                        mention=self._mention,
+                        peer_agent_ids=self._peer_agent_ids,
+                        active=active_recording,
                     )
                 ):
                     await self._commit_pointer(pointer)
@@ -925,6 +934,7 @@ def _apply_yaml_config(_yaml_cfg: dict, basecamp_cfg: dict) -> dict[str, Any] | 
         "mention": "mention",
         "projects": "project_ids",
         "project_ids": "project_ids",
+        "peer_agent_ids": "peer_agent_ids",
         "token_path": "token_file",
         "token_file": "token_file",
         "poll_chat_seconds": "chat_poll_seconds",
@@ -941,7 +951,7 @@ def _apply_yaml_config(_yaml_cfg: dict, basecamp_cfg: dict) -> dict[str, Any] | 
         if source not in basecamp_cfg or destination in extras:
             continue
         value = basecamp_cfg[source]
-        if destination == "project_ids" and isinstance(value, list):
+        if destination in {"project_ids", "peer_agent_ids"} and isinstance(value, list):
             value = ",".join(str(item) for item in value)
         extras[destination] = value
     return extras or None

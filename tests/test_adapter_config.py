@@ -99,6 +99,16 @@ class AdapterConfigTests(unittest.TestCase):
 
         self.assertEqual(_settings(config)["project_ids"], ("11111111",))
 
+    def test_settings_accepts_peer_agent_ids_from_gateway_yaml(self):
+        config = SimpleNamespace(extra={"peer_agent_ids": [22222222, "33333333"]})
+
+        self.assertEqual(_settings(config)["peer_agent_ids"], ("22222222", "33333333"))
+
+    def test_yaml_mapping_preserves_peer_agent_roster(self):
+        extras = _apply_yaml_config({}, {"peer_agent_ids": [22222222, 33333333]})
+
+        self.assertEqual(extras["peer_agent_ids"], "22222222,33333333")
+
     def test_settings_accepts_null_optional_expiry_from_gateway_yaml(self):
         config = SimpleNamespace(extra={"expires_at": None})
 

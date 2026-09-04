@@ -92,12 +92,19 @@ gateway:
       person_email: agent@example.com
       mention: "@HermesAgent"
       project_ids: ["11111111"]
+      peer_agent_ids: ["8765432"]
       token_file: /absolute/path/outside-the-repository/agent-oauth.json
       webhook_public_url: https://agent.example.com/basecamp/webhooks/SECRET
 ```
 
 Keep OAuth credentials, webhook secrets, and live identifiers outside Git. See
 [`.env.example`](.env.example) for every setting.
+
+When two or more agents share a Basecamp account, list every other agent member
+in `peer_agent_ids` or `BASECAMP_PEER_AGENT_IDS`. A peer can start work through
+a structured mention or assignment. Its replies and other implicit follow-ups
+stay quiet, which prevents agent reply loops without breaking human follow-up
+continuity.
 
 ## Operator commands
 

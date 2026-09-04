@@ -56,6 +56,12 @@ Startup checks the configured account, person ID, email, `employee=true`,
 `client=false`, and membership in every allowlisted project. Mutations repeat the
 identity attestation. Resource ownership comes from canonical Basecamp reads.
 
+Each profile also has an explicit peer-agent person-ID roster. A peer-authored
+event can trigger the agent only through a structured mention or assignment.
+Ping lines, ordinary replies, check-in activity, and active-recording follow-ups
+from peers remain quiet. This prevents autonomous reply loops while preserving
+human follow-up continuity.
+
 Ordinary work requires trusted direct interaction, assignment, or an approved
 schedule. Sensitive changes need action-time approval for the exact operation,
 project, and argument digest. Adminland stays unavailable.
