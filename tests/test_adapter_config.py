@@ -50,6 +50,9 @@ class AdapterConfigTests(unittest.TestCase):
             def register_platform(self, **kwargs):
                 self.platform = kwargs
 
+            def register_cli_command(self, **kwargs):
+                self.cli_command = kwargs
+
             def register_tool(self, **kwargs):
                 pass
 
@@ -59,15 +62,17 @@ class AdapterConfigTests(unittest.TestCase):
         from basecamp_plugin.adapter import register
 
         set_multiplex_active(True)
+        context = Context()
         try:
-            register(Context())
+            register(context)
         finally:
             set_multiplex_active(False)
+        self.assertEqual(context.cli_command["name"], "basecamp")
 
-    def test_parses_prefixed_chat_target(self):
+    def test_parses_prefixed_recording_target(self):
         self.assertEqual(
-            _parse_target_ref("basecamp:chat:11111111:22222222"),
-            ("chat:11111111:22222222", None),
+            _parse_target_ref("basecamp:bucket:11111111/recording:22222222"),
+            ("bucket:11111111/recording:22222222", None),
         )
 
     def test_rejects_ambiguous_target(self):
@@ -75,8 +80,8 @@ class AdapterConfigTests(unittest.TestCase):
 
     @patch.dict(os.environ, {"BASECAMP_PROJECT_IDS": "11111111"}, clear=False)
     def test_validator_enforces_project_allowlist(self):
-        self.assertTrue(_validate_target_ref("chat:11111111:22222222"))
-        self.assertIn("allowlist", _validate_target_ref("chat:999:22222222"))
+        self.assertTrue(_validate_target_ref("bucket:11111111/recording:22222222"))
+        self.assertIn("allowlist", _validate_target_ref("bucket:999/recording:22222222"))
 
     def test_yaml_mapping_keeps_tokens_out_of_yaml_contract(self):
         extras = _apply_yaml_config(
@@ -98,6 +103,16 @@ class AdapterConfigTests(unittest.TestCase):
         config = SimpleNamespace(extra={"project_ids": [11111111]})
 
         self.assertEqual(_settings(config)["project_ids"], ("11111111",))
+
+    def test_settings_accepts_peer_agent_ids_from_gateway_yaml(self):
+        config = SimpleNamespace(extra={"peer_agent_ids": [22222222, "33333333"]})
+
+        self.assertEqual(_settings(config)["peer_agent_ids"], ("22222222", "33333333"))
+
+    def test_yaml_mapping_preserves_peer_agent_roster(self):
+        extras = _apply_yaml_config({}, {"peer_agent_ids": [22222222, 33333333]})
+
+        self.assertEqual(extras["peer_agent_ids"], "22222222,33333333")
 
     def test_settings_accepts_null_optional_expiry_from_gateway_yaml(self):
         config = SimpleNamespace(extra={"expires_at": None})

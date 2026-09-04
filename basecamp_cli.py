@@ -147,40 +147,57 @@ class BasecampCLI:
         return data
 
 
-def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="hermes-basecamp")
+def register_cli(parser: argparse.ArgumentParser) -> None:
+    """Register commands for both `hermes basecamp` and the console script."""
     commands = parser.add_subparsers(dest="command", required=True)
-    commands.add_parser("prerequisites", help="Print human-owned Basecamp setup steps")
-    commands.add_parser("doctor", help="Verify identity, full-member role, and project membership")
+    setup = commands.add_parser("setup", help="Verify identity and synchronize configured webhooks")
+    setup.add_argument("--public-url")
+    setup.add_argument("--types", help="Comma-separated Basecamp recording types")
+    setup.add_argument("--yes", action="store_true")
+    doctor = commands.add_parser("doctor", help="Verify identity, receive lanes, cursors, and webhooks")
+    doctor.add_argument("--probe", action="store_true")
     revoke = commands.add_parser("revoke", help="Remove the configured local OAuth token file")
     revoke.add_argument("--token-file", type=Path)
     revoke.add_argument("--yes", action="store_true")
-    webhooks = commands.add_parser("webhook-reconcile", help="Create or repair project webhooks")
-    webhooks.add_argument("--public-url", required=True)
-    webhooks.add_argument("--types", required=True, help="Comma-separated Basecamp recording types")
-    webhooks.add_argument("--yes", action="store_true")
-    journal_list = commands.add_parser("journal-list", help="List unresolved Basecamp mutations")
-    journal_list.add_argument("--profile-id", required=True)
-    journal_release = commands.add_parser(
-        "journal-release", help="Release one exactly matched unresolved mutation for retry"
+    webhooks = commands.add_parser("webhooks", help="Manage expected Basecamp webhooks")
+    webhook_commands = webhooks.add_subparsers(dest="webhook_command", required=True)
+    sync = webhook_commands.add_parser("sync", help="Create, repair, or reactivate expected webhooks")
+    sync.add_argument("--public-url")
+    sync.add_argument("--types", help="Comma-separated Basecamp recording types")
+    sync.add_argument("--yes", action="store_true")
+    journal = commands.add_parser("journal", help="Inspect and reconcile uncertain writes")
+    journal_commands = journal.add_subparsers(dest="journal_command", required=True)
+    journal_commands.add_parser("list", help="List unresolved Basecamp mutations")
+    reconcile = journal_commands.add_parser(
+        "reconcile", help="Release one exactly matched write only after independent confirmation"
     )
-    journal_release.add_argument("--profile-id", required=True)
-    journal_release.add_argument("--idempotency-key", required=True)
-    journal_release.add_argument("--operation", required=True)
-    journal_release.add_argument("--project-id", required=True)
-    journal_release.add_argument("--arguments-json", required=True)
-    journal_release.add_argument("--confirmed-not-applied", action="store_true")
-    journal_release.add_argument("--yes", action="store_true")
+    reconcile.add_argument("--idempotency-key", required=True)
+    reconcile.add_argument("--operation", required=True)
+    reconcile.add_argument("--project-id", required=True)
+    reconcile.add_argument("--arguments-json", required=True)
+    reconcile.add_argument("--confirmed-not-applied", action="store_true")
+    reconcile.add_argument("--yes", action="store_true")
+    test = commands.add_parser("test", help="Run Basecamp integration tests")
+    test_commands = test.add_subparsers(dest="test_command", required=True)
+    live = test_commands.add_parser("live", help="Run the safe-write conductor suite")
+    live.add_argument("--campfire-id", required=True)
+    live.add_argument("--todolist-id", required=True)
+    live.add_argument("--yes", action="store_true")
+    parser.set_defaults(func=dispatch)
+
+
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="hermes-basecamp")
+    parser.add_argument(
+        "-p",
+        "--profile",
+        help="Hermes profile name. Prefer `hermes -p NAME basecamp ...` when available.",
+    )
+    register_cli(parser)
     return parser
 
 
 async def _main_async(args: argparse.Namespace) -> int:
-    if args.command == "prerequisites":
-        from onboarding import ADMINLAND_PREREQUISITES
-
-        for index, item in enumerate(ADMINLAND_PREREQUISITES, 1):
-            print(f"{index}. {item}")
-        return 0
     if args.command == "revoke":
         from onboarding import revoke_local_token
 
@@ -199,18 +216,16 @@ async def _main_async(args: argparse.Namespace) -> int:
 
     load_plugin()
     from basecamp_plugin.adapter import _make_client, _settings
-    from basecamp_plugin.onboarding import doctor
+    from basecamp_plugin.onboarding import ADMINLAND_PREREQUISITES, doctor, probe_runtime
 
     client = _make_client(_settings())
     try:
-        if args.command in {"journal-list", "journal-release"}:
+        if args.command == "journal":
             from basecamp_plugin.operations import BasecampOperations
 
             profile_id = f"{client.expected.account_id}:{client.expected.person_id}"
-            if args.profile_id != profile_id:
-                raise SystemExit("--profile-id must match the configured Basecamp identity")
             operations = BasecampOperations(client, profile_id=profile_id)
-            if args.command == "journal-list":
+            if args.journal_command == "list":
                 print(json.dumps([entry.__dict__ for entry in operations.unresolved_operations()]))
                 return 0
             arguments = json.loads(args.arguments_json)
@@ -226,26 +241,80 @@ async def _main_async(args: argparse.Namespace) -> int:
             )
             print(json.dumps({"released": True, "disposition": disposition}))
             return 0
-        if args.command == "webhook-reconcile":
+        if args.command == "webhooks" or (
+            args.command == "setup" and (args.public_url or os.getenv("BASECAMP_WEBHOOK_PUBLIC_URL", "").strip())
+        ):
+            from basecamp_plugin.sdk_client import SAFE_WEBHOOK_RECORDING_GETTERS
             from basecamp_plugin.webhook_reconciliation import WebhookReconciler
 
+            public_url = (args.public_url or os.getenv("BASECAMP_WEBHOOK_PUBLIC_URL", "")).strip()
+            if not public_url:
+                raise SystemExit("--public-url or BASECAMP_WEBHOOK_PUBLIC_URL is required")
+            raw_types = args.types or ",".join(SAFE_WEBHOOK_RECORDING_GETTERS)
             reconciler = WebhookReconciler(
                 client,
-                payload_url=args.public_url,
-                event_types=tuple(value.strip() for value in args.types.split(",") if value.strip()),
+                payload_url=public_url,
+                event_types=tuple(value.strip() for value in raw_types.split(",") if value.strip()),
             )
             results = await reconciler.reconcile(approved=args.yes)
             print(json.dumps([result.__dict__ for result in results]))
             return 0
+        if args.command == "test":
+            if not args.yes:
+                raise SystemExit("Basecamp live tests create visible test records; pass --yes")
+            from basecamp_plugin.live_test import run_live_test
+
+            report = await run_live_test(
+                client,
+                campfire_id=str(args.campfire_id),
+                todolist_id=str(args.todolist_id),
+            )
+            print(json.dumps(report))
+            return 0 if report.get("ok") else 1
         report = await doctor(client)
-        print(json.dumps(report.__dict__))
-        return 0 if report.healthy else 1
+        output = dict(report.__dict__)
+        if args.command == "setup":
+            output["human_prerequisites"] = list(ADMINLAND_PREREQUISITES)
+        if args.command == "doctor" and args.probe and report.healthy:
+            from basecamp_plugin.inbox import DurableInbox
+            from basecamp_plugin.replay_store import default_replay_path
+
+            path = default_replay_path(client.expected.account_id, client.expected.person_id).with_name(
+                f"{client.expected.account_id}-{client.expected.person_id}-inbox.sqlite3"
+            )
+            output["probe"] = await probe_runtime(client, DurableInbox(path))
+        print(json.dumps(output))
+        healthy = report.healthy
+        if args.command == "doctor" and args.probe:
+            healthy = healthy and output.get("probe", {}).get("state") == "ready"
+        return 0 if healthy else 1
     finally:
         await client.close()
 
 
+def dispatch(args: argparse.Namespace) -> int:
+    return asyncio.run(_main_async(args))
+
+
+def _load_standalone_profile(profile: str | None) -> Path:
+    """Load the same profile-scoped environment that the Hermes CLI uses."""
+    if profile:
+        from hermes_cli.profiles import resolve_profile_env
+
+        home = Path(resolve_profile_env(profile))
+    else:
+        home = Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes").expanduser()
+    os.environ["HERMES_HOME"] = str(home)
+    from hermes_cli.env_loader import load_hermes_dotenv
+
+    load_hermes_dotenv(hermes_home=home)
+    return home
+
+
 def main() -> int:
-    return asyncio.run(_main_async(_parser().parse_args()))
+    args = _parser().parse_args()
+    _load_standalone_profile(args.profile)
+    return dispatch(args)
 
 
 if __name__ == "__main__":

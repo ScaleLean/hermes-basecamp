@@ -19,16 +19,28 @@ class _MentionParser(HTMLParser):
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
         self.person_ids: set[str] = set()
+        self._mention_attachments = 0
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-        if tag.lower() != "bc-attachment":
-            return
+        tag = tag.lower()
         values = {name.lower(): value or "" for name, value in attrs}
+        if tag == "img" and self._mention_attachments:
+            person_id = values.get("data-avatar-for-person-id", "")
+            if person_id.isdigit():
+                self.person_ids.add(person_id)
+            return
+        if tag != "bc-attachment":
+            return
         if values.get("content-type", "").lower() != _MENTION_CONTENT_TYPE:
             return
+        self._mention_attachments += 1
         match = _PERSON_SGID.fullmatch(values.get("sgid", ""))
         if match:
             self.person_ids.add(match.group("person_id"))
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag.lower() == "bc-attachment" and self._mention_attachments:
+            self._mention_attachments -= 1
 
 
 @dataclass(frozen=True)
@@ -83,18 +95,25 @@ def normalize_event(raw: Mapping[str, Any]) -> NormalizedEvent | None:
 
     kind = str(raw.get("kind") or raw.get("action") or "event")
     person_name = str(creator.get("name") or "Basecamp member")
-    title = recording.get("title") or recording.get("content") or raw.get("summary") or kind
+    record_type = str(recording.get("type") or raw.get("recordable_type") or "")
+    if record_type == "Comment":
+        title = recording.get("content") or recording.get("title") or raw.get("summary") or kind
+    else:
+        title = recording.get("title") or recording.get("content") or raw.get("summary") or kind
     text = f"[Basecamp {kind}] {person_name}: {_plain_text(title)}".strip()
 
     parent = raw.get("parent") or {}
     parent_id = _identifier(parent) if isinstance(parent, Mapping) else ""
-    record_type = str(recording.get("type") or raw.get("recordable_type") or "")
-    if record_type in {"Chat::Line", "Chat::Transcript"}:
+    bucket_type = str(bucket.get("type") or raw.get("bucket_type") or "")
+    if bucket_type == "Circle":
         target_id = parent_id or recording_id
-        chat_id = f"chat:{project_id}:{target_id}"
+        chat_id = f"ping:{project_id}"
+    elif record_type in {"Chat::Line", "Chat::Transcript"}:
+        target_id = parent_id or recording_id
+        chat_id = f"bucket:{project_id}/recording:{target_id}"
     else:
-        target_id = parent_id or recording_id
-        chat_id = f"recording:{project_id}:{target_id}"
+        target_id = parent_id if record_type == "Comment" and parent_id else recording_id
+        chat_id = f"bucket:{project_id}/recording:{target_id}"
 
     created = raw.get("created_at") or raw.get("createdAt")
     try:
@@ -116,18 +135,21 @@ def normalize_event(raw: Mapping[str, Any]) -> NormalizedEvent | None:
     )
 
 
-def is_addressed_to(raw: Mapping[str, Any], *, person_id: str, mention: str) -> bool:
-    """Return true only for a structured Basecamp mention or assignment."""
+def is_explicitly_addressed_to(raw: Mapping[str, Any], *, person_id: str) -> bool:
+    """Return true for a Basecamp-authenticated mention or assignment."""
     recording = raw.get("recording") or raw.get("recordable") or {}
     if not isinstance(recording, Mapping):
         recording = {}
-    assignees = recording.get("assignees") or raw.get("assignees") or []
-    if isinstance(assignees, list):
-        for assignee in assignees:
-            if _identifier(assignee) == person_id:
-                return True
+    notification_section = str(raw.get("_notification_section") or "").lower()
+    if notification_section == "mentions":
+        return True
+    if str(raw.get("kind") or "") == "assignment_created":
+        assignees = recording.get("assignees") or raw.get("assignees") or []
+        if isinstance(assignees, list):
+            for assignee in assignees:
+                if _identifier(assignee) == person_id:
+                    return True
 
-    del mention  # Display-only configuration. Authorization uses the person SGID.
     return any(
         person_id in _mentioned_person_ids(value)
         for value in (
@@ -139,10 +161,59 @@ def is_addressed_to(raw: Mapping[str, Any], *, person_id: str, mention: str) -> 
     )
 
 
+def is_addressed_to(raw: Mapping[str, Any], *, person_id: str, mention: str) -> bool:
+    """Return true for a trusted direct Basecamp interaction."""
+    recording = raw.get("recording") or raw.get("recordable") or {}
+    if not isinstance(recording, Mapping):
+        recording = {}
+    bucket = raw.get("bucket") or raw.get("project") or {}
+    creator = raw.get("creator") or raw.get("person") or {}
+    if (
+        isinstance(bucket, Mapping)
+        and str(bucket.get("type") or "") == "Circle"
+        and isinstance(creator, Mapping)
+    ):
+        return creator.get("client") is False
+    notification_section = str(raw.get("_notification_section") or "").lower()
+    if notification_section == "inbox" and str(recording.get("type") or "") == "Question":
+        return True
+
+    del mention  # Display-only configuration. Authorization uses the person SGID.
+    return is_explicitly_addressed_to(raw, person_id=person_id)
+
+
+def is_eligible_for_agent(
+    raw: Mapping[str, Any],
+    *,
+    person_id: str,
+    mention: str,
+    peer_agent_ids: tuple[str, ...] = (),
+    active: bool = False,
+) -> bool:
+    """Apply self-event, peer-agent, direct-address, and follow-up policy."""
+    creator = raw.get("creator") or raw.get("person") or {}
+    creator_id = _identifier(creator)
+    if creator_id == person_id:
+        return False
+    if creator_id in peer_agent_ids:
+        return is_explicitly_addressed_to(raw, person_id=person_id)
+    recording = raw.get("recording") or raw.get("recordable") or {}
+    recording_type = str(recording.get("type") or "") if isinstance(recording, Mapping) else ""
+    is_follow_up = active and recording_type in {"Chat::Line", "Comment"}
+    return is_addressed_to(raw, person_id=person_id, mention=mention) or is_follow_up
+
+
 def parse_target(chat_id: str) -> tuple[str, str, str]:
-    parts = chat_id.split(":", 2)
-    if len(parts) != 3 or parts[0] not in {"chat", "recording"}:
-        raise ValueError("Basecamp target must be chat:<project_id>:<room_id> or recording:<project_id>:<recording_id>")
-    if not parts[1].isdigit() or not parts[2].isdigit():
-        raise ValueError("Basecamp project and recording IDs must be numeric")
-    return parts[0], parts[1], parts[2]
+    if re.fullmatch(r"recording:\d+", chat_id):
+        return "recording", "", chat_id.split(":", 1)[1]
+    if re.fullmatch(r"bucket:\d+", chat_id):
+        return "bucket", chat_id.split(":", 1)[1], ""
+    match = re.fullmatch(r"bucket:(\d+)/recording:(\d+)", chat_id)
+    if match:
+        return "recording", match.group(1), match.group(2)
+    if re.fullmatch(r"ping:\d+", chat_id):
+        return "ping", "", chat_id.split(":", 1)[1]
+    raise ValueError(
+        "Basecamp target must be recording:<id>, bucket:<id>, "
+        "bucket:<id>/recording:<id>, or ping:<circle_id>"
+    )

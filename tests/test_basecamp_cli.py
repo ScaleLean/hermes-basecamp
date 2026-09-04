@@ -1,8 +1,11 @@
 import json
+import os
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
-from basecamp_cli import BasecampCLI, ExpectedIdentity, IdentityMismatchError
+from basecamp_cli import BasecampCLI, ExpectedIdentity, IdentityMismatchError, _load_standalone_profile, _parser
 
 
 class _Process:
@@ -26,6 +29,37 @@ class BasecampCLITests(unittest.IsolatedAsyncioTestCase):
             self.client.command(["me"]),
             ["basecamp", "--profile", "agent", "--account", "1234567", "--json", "me"],
         )
+
+    def test_operator_command_grammar(self):
+        self.assertTrue(_parser().parse_args(["doctor", "--probe"]).probe)
+        profiled = _parser().parse_args(["--profile", "agentb", "doctor", "--probe"])
+        self.assertEqual(profiled.profile, "agentb")
+        self.assertTrue(profiled.probe)
+        self.assertEqual(
+            _parser().parse_args(["webhooks", "sync", "--public-url", "https://example.test/hook"]).webhook_command,
+            "sync",
+        )
+        self.assertEqual(_parser().parse_args(["journal", "list"]).journal_command, "list")
+        self.assertEqual(
+            _parser().parse_args(["test", "live", "--campfire-id", "1", "--todolist-id", "2"]).test_command,
+            "live",
+        )
+
+    def test_standalone_profile_loads_the_selected_hermes_environment(self):
+        with tempfile.TemporaryDirectory() as temp:
+            profile = Path(temp) / "profiles" / "agentb"
+            profile.mkdir(parents=True)
+            with (
+                patch.dict(os.environ, {}, clear=True),
+                patch("hermes_cli.profiles.resolve_profile_env", return_value=str(profile)) as resolve,
+                patch("hermes_cli.env_loader.load_hermes_dotenv") as load,
+            ):
+                selected = _load_standalone_profile("AgentB")
+
+                self.assertEqual(selected, profile)
+                self.assertEqual(os.environ["HERMES_HOME"], str(profile))
+                resolve.assert_called_once_with("AgentB")
+                load.assert_called_once_with(hermes_home=profile)
 
     async def test_matching_identity_passes(self):
         process = _Process({"ok": True, "data": {"id": 123, "email_address": "agent@example.com"}})

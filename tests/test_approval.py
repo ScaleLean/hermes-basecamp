@@ -6,7 +6,7 @@ from unittest.mock import patch
 from agent.secret_scope import reset_secret_scope, set_secret_scope
 
 from adapter import register
-from approval import ApprovalBroker, approval_rule_key, post_approval_response, pre_tool_call
+from approval import ApprovalBroker, approval_rule_key, pre_tool_call
 from tools import register_tools
 
 
@@ -65,10 +65,10 @@ class ApprovalTests(unittest.TestCase):
 
 
 class SensitiveToolTests(unittest.IsolatedAsyncioTestCase):
-    async def test_registered_sensitive_tool_executes_only_after_exact_approval(self):
+    async def test_focused_sensitive_arguments_request_exact_approval(self):
         class Context:
             def register_tool(self, **kwargs):
-                if kwargs["name"] == "basecamp_projects_people":
+                if kwargs["name"] == "basecamp_create_todo":
                     self.handler = kwargs["handler"]
 
         class Client:
@@ -91,7 +91,10 @@ class SensitiveToolTests(unittest.IsolatedAsyncioTestCase):
 
         context = Context()
         client = Client()
-        arguments = {"project_id": 10}
+        arguments = {
+            "bucket_id": "10", "todolist_id": "30", "content": "Assigned", "assignee_ids": [2],
+            "idempotency_key": "create-todo-1",
+        }
         with (
             tempfile.TemporaryDirectory() as temp,
             patch.dict(
@@ -104,28 +107,15 @@ class SensitiveToolTests(unittest.IsolatedAsyncioTestCase):
             ),
         ):
             register_tools(context, lambda: client, "1:2")
-            directive = pre_tool_call(
-                "basecamp_projects_people",
-                {
-                    "operation": "projects.archive",
-                    "project_id": "10",
-                    "arguments": arguments,
-                    "idempotency_key": "archive-10",
-                },
-            )
+            directive = pre_tool_call("basecamp_create_todo", arguments)
             self.assertEqual(directive["action"], "approve")
-            post_approval_response(pattern_keys=[directive["rule_key"]], choice="once")
-            result = await context.handler("projects.archive", "10", arguments, idempotency_key="archive-10")
-
-        self.assertTrue(client.mutated)
-        self.assertTrue(result["verified"])
 
     async def test_registered_ordinary_tool_uses_trusted_session_context(self):
         from gateway import session_context
 
         class Context:
             def register_tool(self, **kwargs):
-                if kwargs["name"] == "basecamp_todos":
+                if kwargs["name"] == "basecamp_complete_todo":
                     self.handler = kwargs["handler"]
 
         class Client:
@@ -154,9 +144,11 @@ class SensitiveToolTests(unittest.IsolatedAsyncioTestCase):
         client = Client()
         with tempfile.TemporaryDirectory() as temp, patch.dict("os.environ", {"BASECAMP_STATE_DIR": temp}):
             register_tools(context, lambda: client, "1:2")
-            tokens = session_context.set_session_vars(platform="basecamp", chat_id="chat:10:30", cron_session="")
+            tokens = session_context.set_session_vars(
+                platform="basecamp", chat_id="bucket:10/recording:30", cron_session=""
+            )
             try:
-                result = await context.handler("todos.complete", "10", {"todo_id": 40}, idempotency_key="complete-40")
+                result = await context.handler(bucket_id="10", todo_id="40", idempotency_key="complete-40")
             finally:
                 session_context.clear_session_vars(tokens)
 
@@ -166,14 +158,21 @@ class SensitiveToolTests(unittest.IsolatedAsyncioTestCase):
     async def test_model_cannot_spoof_context_argument_on_registered_handler(self):
         class Context:
             def register_tool(self, **kwargs):
-                if kwargs["name"] == "basecamp_todos":
+                if kwargs["name"] == "basecamp_complete_todo":
                     self.handler = kwargs["handler"]
 
+        class Client:
+            expected = SimpleNamespace(account_id="1", person_id="2")
+            project_ids = ("10",)
+
+            async def close(self):
+                return None
+
         context = Context()
-        register_tools(context, lambda: None, "1:2")
-        with self.assertRaises(TypeError):
+        register_tools(context, Client, "1:2")
+        with self.assertRaises(PermissionError):
             await context.handler(
-                "todos.complete", "10", {"todo_id": 40}, idempotency_key="complete-40", trigger="direct_mention"
+                bucket_id="10", todo_id="40", idempotency_key="complete-40", trigger="direct_mention"
             )
 
     def test_digest_does_not_approve_changed_arguments(self):

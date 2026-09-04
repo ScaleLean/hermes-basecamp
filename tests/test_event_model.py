@@ -1,6 +1,6 @@
 import unittest
 
-from event_model import is_addressed_to, normalize_event, parse_target
+from event_model import is_addressed_to, is_eligible_for_agent, normalize_event, parse_target
 
 
 class EventModelTests(unittest.TestCase):
@@ -17,7 +17,7 @@ class EventModelTests(unittest.TestCase):
             }
         )
         self.assertIsNotNone(event)
-        self.assertEqual(event.chat_id, "recording:22:44")
+        self.assertEqual(event.chat_id, "bucket:22/recording:44")
         self.assertIn("Hello", event.text)
 
     def test_normalizes_chat_line_to_chat_target(self):
@@ -31,7 +31,21 @@ class EventModelTests(unittest.TestCase):
                 "parent": {"id": 44},
             }
         )
-        self.assertEqual(event.chat_id, "chat:22:44")
+        self.assertEqual(event.chat_id, "bucket:22/recording:44")
+
+    def test_normalizes_todo_to_itself_not_its_todolist(self):
+        event = normalize_event(
+            {
+                "id": 77,
+                "kind": "todo_created",
+                "creator": {"id": 11, "name": "Human User"},
+                "bucket": {"id": 22},
+                "recording": {"id": 33, "type": "Todo", "title": "Do the work"},
+                "parent": {"id": 44, "type": "Todolist"},
+            }
+        )
+
+        self.assertEqual(event.chat_id, "bucket:22/recording:33")
 
     def test_rejects_incomplete_events(self):
         self.assertIsNone(normalize_event({"id": 1}))
@@ -41,9 +55,11 @@ class EventModelTests(unittest.TestCase):
             parse_target("general")
         with self.assertRaises(ValueError):
             parse_target("chat:not-a-number:2")
+        with self.assertRaises(ValueError):
+            parse_target("chat:22:44")
 
     def test_target_parser_accepts_explicit_target(self):
-        self.assertEqual(parse_target("chat:22:44"), ("chat", "22", "44"))
+        self.assertEqual(parse_target("bucket:22/recording:44"), ("recording", "22", "44"))
 
     def test_structured_person_mention_is_addressed(self):
         raw = {
@@ -51,6 +67,19 @@ class EventModelTests(unittest.TestCase):
                 "content": (
                     'Can <bc-attachment content-type="application/vnd.basecamp.mention" '
                     'sgid="sgid://bc3/Person/123">Hermes Agent</bc-attachment> check this?'
+                )
+            }
+        }
+        self.assertTrue(is_addressed_to(raw, person_id="123", mention="@HermesAgent"))
+
+    def test_signed_structured_mention_uses_nested_person_id(self):
+        raw = {
+            "recording": {
+                "content": (
+                    '<p><bc-attachment content-type="application/vnd.basecamp.mention" '
+                    'sgid="opaque-signed-global-id"><figure>'
+                    '<img data-avatar-for-person-id="123" alt="Hermes Agent">'
+                    "</figure></bc-attachment></p>"
                 )
             }
         }
@@ -72,9 +101,178 @@ class EventModelTests(unittest.TestCase):
         self.assertFalse(is_addressed_to(raw, person_id="123", mention="@HermesAgent"))
 
     def test_explicit_assignment_is_addressed(self):
-        raw = {"recording": {"assignees": [{"id": 123}]}}
+        raw = {"kind": "assignment_created", "recording": {"assignees": [{"id": 123}]}}
         self.assertTrue(is_addressed_to(raw, person_id="123", mention="@HermesAgent"))
+
+    def test_assigned_todo_creation_waits_for_assignment_snapshot(self):
+        raw = {
+            "kind": "todo_created",
+            "recording": {"id": 33, "type": "Todo", "assignees": [{"id": 123}]},
+        }
+
+        self.assertFalse(is_addressed_to(raw, person_id="123", mention="@HermesAgent"))
+
+    def test_active_todo_mutation_is_not_a_follow_up(self):
+        raw = {
+            "kind": "todo_assignment_changed",
+            "creator": {"id": 789, "client": False},
+            "recording": {"id": 33, "type": "Todo", "assignees": [{"id": 123}]},
+        }
+
+        self.assertFalse(
+            is_eligible_for_agent(
+                raw,
+                person_id="123",
+                mention="@HermesAgent",
+                active=True,
+            )
+        )
 
     def test_ambient_activity_is_not_addressed(self):
         raw = {"recording": {"content": "General project update"}}
         self.assertFalse(is_addressed_to(raw, person_id="123", mention="@HermesAgent"))
+
+    def test_ping_from_non_client_member_is_a_direct_trigger(self):
+        raw = {
+            "id": 91,
+            "kind": "ping_line_created",
+            "created_at": "2026-09-04T01:00:00Z",
+            "creator": {"id": 11, "name": "Teammate", "client": False},
+            "bucket": {"id": 55, "type": "Circle"},
+            "recording": {"id": 92, "type": "Chat::Line", "content": "Hello"},
+            "parent": {"id": 93, "type": "Chat::Transcript"},
+        }
+        normalized = normalize_event(raw)
+        self.assertEqual(normalized.chat_id, "ping:55")
+        self.assertTrue(is_addressed_to(raw, person_id="123", mention="@HermesAgent"))
+
+    def test_ping_from_client_is_rejected(self):
+        raw = {
+            "creator": {"id": 11, "client": True},
+            "bucket": {"id": 55, "type": "Circle"},
+            "recording": {"id": 92, "type": "Chat::Line", "content": "Hello"},
+        }
+        self.assertFalse(is_addressed_to(raw, person_id="123", mention="@HermesAgent"))
+
+    def test_peer_agent_reply_cannot_continue_an_active_campfire(self):
+        raw = {
+            "creator": {"id": 456, "client": False},
+            "bucket": {"id": 10},
+            "recording": {"id": 92, "type": "Chat::Line", "content": "Received."},
+        }
+
+        self.assertFalse(
+            is_eligible_for_agent(
+                raw,
+                person_id="123",
+                mention="@HermesAgent",
+                peer_agent_ids=("456",),
+                active=True,
+            )
+        )
+
+    def test_peer_agent_structured_mention_is_an_explicit_trigger(self):
+        raw = {
+            "creator": {"id": 456, "client": False},
+            "bucket": {"id": 10},
+            "recording": {
+                "id": 92,
+                "type": "Chat::Line",
+                "content": (
+                    '<bc-attachment content-type="application/vnd.basecamp.mention" '
+                    'sgid="sgid://bc3/Person/123"></bc-attachment> Please take this.'
+                ),
+            },
+        }
+
+        self.assertTrue(
+            is_eligible_for_agent(
+                raw,
+                person_id="123",
+                mention="@HermesAgent",
+                peer_agent_ids=("456",),
+                active=True,
+            )
+        )
+
+    def test_peer_agent_assignment_is_an_explicit_trigger(self):
+        raw = {
+            "kind": "assignment_created",
+            "creator": {"id": 456, "client": False},
+            "bucket": {"id": 10},
+            "recording": {"id": 92, "type": "Todo", "assignees": [{"id": 123}]},
+        }
+
+        self.assertTrue(
+            is_eligible_for_agent(
+                raw,
+                person_id="123",
+                mention="@HermesAgent",
+                peer_agent_ids=("456",),
+                active=False,
+            )
+        )
+
+    def test_peer_agent_ping_line_is_not_an_automatic_trigger(self):
+        raw = {
+            "creator": {"id": 456, "client": False},
+            "bucket": {"id": 55, "type": "Circle"},
+            "recording": {"id": 92, "type": "Chat::Line", "content": "Reply"},
+        }
+
+        self.assertFalse(
+            is_eligible_for_agent(
+                raw,
+                person_id="123",
+                mention="@HermesAgent",
+                peer_agent_ids=("456",),
+                active=False,
+            )
+        )
+
+    def test_human_follow_up_remains_eligible_on_an_active_recording(self):
+        raw = {
+            "creator": {"id": 789, "client": False},
+            "bucket": {"id": 10},
+            "recording": {"id": 92, "type": "Chat::Line", "content": "One more question."},
+        }
+
+        self.assertTrue(
+            is_eligible_for_agent(
+                raw,
+                person_id="123",
+                mention="@HermesAgent",
+                peer_agent_ids=("456",),
+                active=True,
+            )
+        )
+
+    def test_self_authored_event_is_never_eligible(self):
+        raw = {
+            "creator": {"id": 123, "client": False},
+            "bucket": {"id": 10},
+            "recording": {
+                "id": 92,
+                "type": "Chat::Line",
+                "content": (
+                    '<bc-attachment content-type="application/vnd.basecamp.mention" '
+                    'sgid="sgid://bc3/Person/123"></bc-attachment>'
+                ),
+            },
+        }
+
+        self.assertFalse(
+            is_eligible_for_agent(
+                raw,
+                person_id="123",
+                mention="@HermesAgent",
+                peer_agent_ids=("456",),
+                active=True,
+            )
+        )
+
+    def test_official_target_grammar(self):
+        self.assertEqual(parse_target("recording:44"), ("recording", "", "44"))
+        self.assertEqual(parse_target("bucket:22"), ("bucket", "22", ""))
+        self.assertEqual(parse_target("bucket:22/recording:44"), ("recording", "22", "44"))
+        self.assertEqual(parse_target("ping:55"), ("ping", "", "55"))

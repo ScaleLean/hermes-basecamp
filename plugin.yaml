@@ -1,7 +1,7 @@
 name: basecamp-platform
 label: Basecamp
 kind: platform
-version: 0.2.0a2
+version: 0.3.0a1
 description: >
   Bring a Hermes agent into Basecamp as a dedicated member with its own
   identity, project access, and activity history.
@@ -16,14 +16,16 @@ python_dependencies:
   - "basecamp-sdk>=0.16.0,<0.17"
   - "markdown-it-py>=3,<5"
 provides_tools:
-  - basecamp_projects_people
-  - basecamp_todos
-  - basecamp_messages
-  - basecamp_cards
-  - basecamp_schedules_checkins
-  - basecamp_files
-  - basecamp_discovery
-  - basecamp_extras
+  - basecamp_create_todo
+  - basecamp_complete_todo
+  - basecamp_reopen_todo
+  - basecamp_read_history
+  - basecamp_add_boost
+  - basecamp_move_card
+  - basecamp_post_message
+  - basecamp_answer_checkin
+  - basecamp_api_read
+  - basecamp_api_write
 provides_hooks:
   - pre_tool_call
   - post_approval_response
@@ -77,16 +79,24 @@ optional_env:
     description: "Campfire polling interval, minimum 10 seconds"
     prompt: "Basecamp chat poll interval"
     password: false
+  - name: BASECAMP_POLL_PING_SECONDS
+    description: "Ping polling interval, minimum 10 seconds"
+    prompt: "Basecamp Ping poll interval"
+    password: false
   - name: BASECAMP_POLL_NOTIFY_SECONDS
     description: "Notification polling interval, minimum 15 seconds"
     prompt: "Basecamp notification poll interval"
+    password: false
+  - name: BASECAMP_POLL_ASSIGNMENT_SECONDS
+    description: "My Assignments polling interval, minimum 15 seconds"
+    prompt: "Basecamp assignment poll interval"
     password: false
   - name: BASECAMP_RECONCILE_SECONDS
     description: "Timeline reconciliation interval, minimum 60 seconds"
     prompt: "Basecamp reconciliation interval"
     password: false
   - name: BASECAMP_HOME_CHANNEL
-    description: "Default cron target, such as chat:PROJECT_ID:CAMPFIRE_ID"
+    description: "Default cron target, such as bucket:PROJECT_ID/recording:CAMPFIRE_ID"
     prompt: "Basecamp home channel"
     password: false
   - name: BASECAMP_ALLOWED_USERS
@@ -96,6 +106,10 @@ optional_env:
   - name: BASECAMP_ALLOW_ALL_USERS
     description: "Allow any Basecamp member to trigger Hermes"
     prompt: "Allow all Basecamp members?"
+    password: false
+  - name: BASECAMP_PEER_AGENT_IDS
+    description: "Comma-separated Basecamp person IDs for other agent members; their implicit follow-ups are ignored"
+    prompt: "Peer Basecamp agent person IDs"
     password: false
   - name: BASECAMP_STATE_DIR
     description: "Owner-only directory for durable cursors, replay state, and operation journals"
@@ -120,4 +134,8 @@ optional_env:
   - name: BASECAMP_WEBHOOK_TLS_PROXY
     description: "Explicitly confirm that a non-loopback bind is protected by a trusted TLS reverse proxy"
     prompt: "Webhook bind protected by TLS proxy?"
+    password: false
+  - name: BASECAMP_WEBHOOK_PUBLIC_URL
+    description: "Stable HTTPS webhook URL registered for every allowlisted project"
+    prompt: "Basecamp webhook public URL"
     password: false

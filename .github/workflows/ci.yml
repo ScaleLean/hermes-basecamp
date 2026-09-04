@@ -8,9 +8,6 @@ on:
 permissions:
   contents: read
 
-env:
-  HERMES_AGENT_COMMIT: 63279301bcbdc185c1b07b98a9312eb0c862f26d
-
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -18,13 +15,14 @@ jobs:
       fail-fast: false
       matrix:
         python-version: ['3.11', '3.12', '3.13']
+        hermes-ref: ['63279301bcbdc185c1b07b98a9312eb0c862f26d', 'main']
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Check out Hermes Agent
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: NousResearch/hermes-agent
-          ref: ${{ env.HERMES_AGENT_COMMIT }}
+          ref: ${{ matrix.hermes-ref }}
           path: hermes-agent
           persist-credentials: false
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
@@ -50,3 +48,21 @@ jobs:
           /tmp/hermes-basecamp-wheel/bin/python -c "import adapter, policy, operations"
       - name: Validate plugin manifest
         run: hermes plugins doctor . --ci
+      - name: Verify frozen SDK inventory and routes
+        run: python scripts/generate_sdk_routes.py --check
+
+  secret-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: stable
+          cache: false
+      - name: Install Gitleaks
+        run: go install github.com/zricethezav/gitleaks/v8@v8.30.1
+      - name: Scan tracked files and Git history
+        run: gitleaks detect --source . --redact --no-banner

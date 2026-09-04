@@ -87,12 +87,21 @@ class WebhookReconciler:
                 action = "created"
             if not webhook_id:
                 raise RuntimeError("Basecamp webhook mutation returned no ID")
+            scoped = await self.client.call(
+                "webhooks", "list", {"bucket_id": int(project_id), "max_items": 100}
+            )
+            scoped_matches = [
+                item
+                for item in scoped
+                if isinstance(item, Mapping)
+                and str(item.get("id") or "") == webhook_id
+                and str(item.get("payload_url") or "") == self.payload_url
+            ]
             verified = await self.client.call("webhooks", "get", {"webhook_id": int(webhook_id)})
             if not isinstance(verified, Mapping):
                 raise TypeError("Basecamp webhook read-back is invalid")
-            bucket = verified.get("bucket") or {}
             valid = (
-                str(bucket.get("id") or "") == project_id
+                len(scoped_matches) == 1
                 and str(verified.get("payload_url") or "") == self.payload_url
                 and verified.get("active") is True
                 and tuple(sorted(str(value) for value in (verified.get("types") or []))) == self.event_types

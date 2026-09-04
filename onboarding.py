@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -54,6 +56,79 @@ async def doctor(client: Any) -> DoctorReport:
         tuple(client.project_ids),
         health={"attestation_ok": True, "identity_ok": True, "role_ok": True, "revoked": False},
     )
+
+
+async def probe_runtime(client: Any, inbox: Any) -> dict[str, Any]:
+    """Probe each receive lane independently and return content-free health."""
+    lanes: dict[str, dict[str, Any]] = {}
+
+    async def run(name: str, operation: Any) -> Any:
+        try:
+            value = await operation
+        except Exception as exc:  # noqa: BLE001 - each lane must report independently
+            lanes[name] = {"ok": False, "error": type(exc).__name__}
+            return None
+        count = len(value) if isinstance(value, list) else 1
+        lanes[name] = {"ok": True, "items": count}
+        return value
+
+    campfires = await run("campfire_discovery", client.campfires(max_items=500))
+    chat_operations = []
+    if isinstance(campfires, list):
+        for room in campfires:
+            bucket = room.get("bucket") or {} if isinstance(room, Mapping) else {}
+            project_id = str(bucket.get("id") or "") if isinstance(bucket, Mapping) else ""
+            room_id = str(room.get("id") or "") if isinstance(room, Mapping) else ""
+            if project_id and room_id:
+                chat_operations.append(
+                    run(
+                        f"campfire:{room_id}",
+                        client.campfire_lines(project_id=project_id, campfire_id=room_id, max_items=1),
+                    )
+                )
+    await asyncio.gather(
+        run("pings", client.pings()),
+        run("notifications", client.notifications()),
+        run("assignments", client.assignments()),
+        run("activity", client.timeline(limit_per_project=1)),
+        *chat_operations,
+    )
+    required = {"campfire_discovery", "pings", "notifications", "assignments", "activity"}
+    lane_ok = all(lanes.get(name, {}).get("ok") is True for name in required)
+    webhook_state = "unconfigured"
+    public_url = os.getenv("BASECAMP_WEBHOOK_PUBLIC_URL", "").strip()
+    if public_url:
+        webhook_state = "healthy"
+        for project_id in client.project_ids:
+            try:
+                webhooks = await client.call(
+                    "webhooks", "list", {"bucket_id": int(project_id), "max_items": 100}
+                )
+            except Exception:  # noqa: BLE001 - health output records state, not message content
+                webhook_state = "unavailable"
+                break
+            matches = [
+                item
+                for item in webhooks
+                if isinstance(item, Mapping)
+                and str(item.get("payload_url") or "") == public_url
+                and item.get("active") is True
+            ]
+            if len(matches) != 1:
+                webhook_state = "drifted"
+                break
+    inbox_health = inbox.stats()
+    state = (
+        "ready"
+        if lane_ok and webhook_state == "healthy" and inbox_health.get("poison", 0) == 0
+        else "recovering"
+    )
+    return {
+        "state": state,
+        "lanes": lanes,
+        "inbox": inbox_health,
+        "webhook_registration": webhook_state,
+    }
 
 
 def revoke_local_token(path: Path, *, approved: bool) -> bool:

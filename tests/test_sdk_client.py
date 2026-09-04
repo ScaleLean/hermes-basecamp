@@ -30,6 +30,141 @@ class _Account:
 
 
 class SDKIdentityTests(unittest.IsolatedAsyncioTestCase):
+    async def test_resolve_ping_transcript_from_circle_notification(self):
+        client = object.__new__(BasecampSDKClient)
+        client._account = SimpleNamespace(
+            my_notifications=SimpleNamespace(
+                get_my_notifications=AsyncMock(
+                    return_value={
+                        "unreads": [
+                            {
+                                "section": "pings",
+                                "subscription_url": (
+                                    "https://3.basecampapi.com/1/buckets/55/recordings/66/subscription.json"
+                                ),
+                            }
+                        ]
+                    }
+                )
+            )
+        )
+
+        self.assertEqual(await client.resolve_ping_transcript("55"), "66")
+
+    async def test_resolve_target_recognizes_allowlisted_campfire(self):
+        client = object.__new__(BasecampSDKClient)
+        client.project_ids = ("10",)
+        client._account = SimpleNamespace(
+            campfires=SimpleNamespace(get=AsyncMock(return_value={"id": 30, "bucket": {"id": 10}}))
+        )
+
+        self.assertEqual(await client.resolve_target("30", "10"), ("chat", "10"))
+
+    async def test_pings_expand_to_canonical_circle_lines(self):
+        client = object.__new__(BasecampSDKClient)
+        client.project_ids = ("10",)
+        readings = {
+            "unreads": [{
+                "id": 1, "section": "pings",
+                "subscription_url": "https://3.basecampapi.com/1/buckets/55/recordings/66/subscription.json",
+                "participants": [{"id": 8}],
+            }]
+        }
+        line = {"id": 77, "created_at": "2026-09-04T01:00:00Z", "creator": {"id": 8, "client": False}}
+        campfires = SimpleNamespace(list_lines=AsyncMock(return_value=[line]))
+        client._account = SimpleNamespace(
+            my_notifications=SimpleNamespace(get_my_notifications=AsyncMock(return_value=readings)),
+            campfires=campfires,
+        )
+        events = await client.pings()
+        self.assertEqual(events[0]["bucket"], {"id": "55", "type": "Circle"})
+        self.assertEqual(events[0]["parent"]["id"], "66")
+        self.assertEqual(events[0]["_stream_id"], "ping:55")
+
+    async def test_notification_mention_resolves_chat_line_from_app_url(self):
+        client = object.__new__(BasecampSDKClient)
+        client.project_ids = ("10",)
+        payload = {
+            "unreads": [
+                {
+                    "id": 1,
+                    "section": "mentions",
+                    "type": "Mention",
+                    "app_url": "https://app.basecamp.com/1/buckets/10/chats/30@40",
+                    "subscription_url": (
+                        "https://3.basecampapi.com/1/buckets/10/recordings/30/subscription.json"
+                    ),
+                    "creator": {"id": 8, "client": False},
+                }
+            ]
+        }
+        client._account = SimpleNamespace(
+            my_notifications=SimpleNamespace(get_my_notifications=AsyncMock(return_value=payload))
+        )
+
+        events = await client.notifications()
+
+        self.assertEqual(events[0]["recording"], {"id": "40", "type": "Chat::Line"})
+        self.assertEqual(events[0]["parent"], {"id": "30", "type": "Chat::Transcript"})
+        self.assertEqual(events[0]["_notification_section"], "mentions")
+
+    async def test_notification_assignment_resolves_todo_from_app_url(self):
+        client = object.__new__(BasecampSDKClient)
+        client.project_ids = ("10",)
+        payload = {
+            "unreads": [
+                {
+                    "id": 2,
+                    "section": "inbox",
+                    "type": "Assignment",
+                    "app_url": "https://app.basecamp.com/1/buckets/10/todos/50",
+                    "subscription_url": (
+                        "https://3.basecampapi.com/1/buckets/10/recordings/50/subscription.json"
+                    ),
+                    "creator": {"id": 8, "client": False},
+                }
+            ]
+        }
+        client._account = SimpleNamespace(
+            my_notifications=SimpleNamespace(get_my_notifications=AsyncMock(return_value=payload))
+        )
+
+        events = await client.notifications()
+
+        self.assertEqual(events[0]["recording"], {"id": "50", "type": "Todo"})
+
+    async def test_assignments_filter_denied_projects_and_name_the_stream(self):
+        client = object.__new__(BasecampSDKClient)
+        client.project_ids = ("10",)
+        client.expected = ExpectedIdentity("1", "7", "agent@example.com")
+        payload = {
+            "priorities": [{"id": 40, "type": "todo", "bucket": {"id": 10}}],
+            "non_priorities": [{"id": 41, "type": "Todo", "updated_at": "2026-09-04T01:00:00Z", "bucket": {"id": 99}}],
+        }
+        get_todo = AsyncMock(
+            return_value={
+                "id": 40,
+                "type": "Todo",
+                "updated_at": "2026-09-04T02:00:00Z",
+                "creator": {"id": 8, "name": "Member", "client": False},
+                "assignees": [{"id": 7}],
+                "bucket": {"id": 10},
+            }
+        )
+        client._account = SimpleNamespace(
+            my_assignments=SimpleNamespace(get_my_assignments=AsyncMock(return_value=payload)),
+            todos=SimpleNamespace(get=get_todo),
+        )
+        events = await client.assignments()
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["assignees"], [{"id": 7}])
+        self.assertEqual(events[0]["creator"]["id"], 8)
+        self.assertEqual(events[0]["created_at"], "2026-09-04T02:00:00Z")
+        self.assertEqual(events[0]["id"], "assignment:40")
+        self.assertEqual(events[0]["recording"]["type"], "Todo")
+        self.assertEqual(events[0]["_stream_id"], "assignments")
+        get_todo.assert_awaited_once_with(todo_id=40)
+
     async def test_identity_match(self):
         client = object.__new__(BasecampSDKClient)
         client.expected = ExpectedIdentity("1234567", "123", "agent@example.com")
@@ -86,6 +221,36 @@ class SDKIdentityTests(unittest.IsolatedAsyncioTestCase):
             await client.post_chat("10", "30", "denied")
         campfires.create_line.assert_not_awaited()
 
+    async def test_ping_write_requires_matching_authenticated_circle(self):
+        client = object.__new__(BasecampSDKClient)
+        client.project_ids = ("10",)
+        client.resolve_ping_transcript = AsyncMock(return_value="66")
+        campfires = SimpleNamespace(
+            get=AsyncMock(),
+            create_line=AsyncMock(return_value={"id": 90}),
+        )
+        client._account = SimpleNamespace(campfires=campfires)
+
+        result = await client.post_chat("55", "66", "hello")
+
+        self.assertEqual(result["id"], 90)
+        client.resolve_ping_transcript.assert_awaited_once_with("55")
+        campfires.get.assert_not_awaited()
+        campfires.create_line.assert_awaited_once_with(
+            campfire_id=66, content="hello", content_type="text/html"
+        )
+
+    async def test_ping_write_rejects_mismatched_transcript(self):
+        client = object.__new__(BasecampSDKClient)
+        client.project_ids = ("10",)
+        client.resolve_ping_transcript = AsyncMock(return_value="77")
+        campfires = SimpleNamespace(create_line=AsyncMock())
+        client._account = SimpleNamespace(campfires=campfires)
+
+        with self.assertRaises(OwnershipMismatchError):
+            await client.post_chat("55", "66", "denied")
+        campfires.create_line.assert_not_awaited()
+
     async def test_recording_target_project_mismatch_never_mutates(self):
         client = object.__new__(BasecampSDKClient)
         client.project_ids = ("10",)
@@ -95,6 +260,49 @@ class SDKIdentityTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(OwnershipMismatchError):
             await client.post_comment("10", "40", "denied")
         comments.create.assert_not_awaited()
+
+    async def test_canonical_recording_ownership_allows_comment(self):
+        client = object.__new__(BasecampSDKClient)
+        client.project_ids = ("10",)
+        client._owned_recordings = {}
+        events = SimpleNamespace(list=AsyncMock())
+        comments = SimpleNamespace(create=AsyncMock(return_value={"id": 50}))
+        client._account = SimpleNamespace(events=events, comments=comments)
+
+        client._require_owned({"id": 40, "bucket": {"id": 10}}, "10")
+        result = await client.post_comment("10", "40", "result")
+
+        self.assertEqual(result["id"], 50)
+        events.list.assert_not_awaited()
+        comments.create.assert_awaited_once_with(recording_id=40, content="result")
+
+    async def test_uncertain_comment_reconciliation_finds_agent_authored_exact_content(self):
+        client = object.__new__(BasecampSDKClient)
+        client.expected = ExpectedIdentity("1", "7", "agent@example.com")
+        comments = SimpleNamespace(
+            list=AsyncMock(return_value=[
+                {"id": 1, "content": "result", "creator": {"id": 8}, "created_at": "2026-09-04T01:00:00Z"},
+                {"id": 2, "content": "result", "creator": {"id": 7}, "created_at": "2026-09-04T01:00:00Z"},
+            ])
+        )
+        client._account = SimpleNamespace(comments=comments)
+
+        matched = await client.reconcile_delivery("recording", "40", "result")
+
+        self.assertEqual(matched["id"], 2)
+        comments.list.assert_awaited_once_with(recording_id=40, max_items=100)
+
+    async def test_uncertain_chat_reconciliation_uses_known_item_id_first(self):
+        client = object.__new__(BasecampSDKClient)
+        client.expected = ExpectedIdentity("1", "7", "agent@example.com")
+        line = {"id": 3, "content": "hello", "creator": {"id": 7}}
+        campfires = SimpleNamespace(get_line=AsyncMock(return_value=line), list_lines=AsyncMock())
+        client._account = SimpleNamespace(campfires=campfires)
+
+        matched = await client.reconcile_delivery("chat", "30", "hello", item_id="3")
+
+        self.assertEqual(matched, line)
+        campfires.list_lines.assert_not_awaited()
 
     async def test_call_rejects_unknown_arguments_before_sdk_dispatch(self):
         client = object.__new__(BasecampSDKClient)

@@ -1,71 +1,86 @@
 # Hermes Basecamp
 
-Bring a Hermes agent into Basecamp as a teammate, not as your shadow.
+Hermes Basecamp makes one Hermes agent a dedicated Basecamp teammate.
 
-Each agent signs in with its own Basecamp member account. It has its own name,
-email address, project access, and activity history. Add it to a project,
-mention it, or assign it work. Its replies and changes appear under its own
-identity.
+The agent uses its own Basecamp member, email address, OAuth grant, Hermes home,
+gateway, memory, and local state. It never acts through a human member's token.
+Its replies and work appear under its own Basecamp identity.
 
-Hermes Basecamp is a native Hermes platform plugin built on the official
-Basecamp Python SDK and Basecamp's [agent-first model](https://basecamp.com/agents).
+This standalone Hermes platform plugin uses Basecamp's official Python SDK. Its
+interaction model follows Basecamp's
+[official OpenClaw plugin](https://github.com/basecamp/openclaw-basecamp) and
+[agent model](https://basecamp.com/agents).
 
-**Status:** Public alpha. The identity and safety contracts are tested; the
-public interface can still change before 1.0.
+**Status:** 0.3 development. The live Maximus member has passed one real
+Campfire mention and reply test. The 24-hour 1.0 release gate has not passed.
 
-## What it does
+## Participation model
 
-- Listens for Campfire messages, assignments, notifications, and project
-  activity.
-- Replies in the same Campfire or Basecamp recording.
-- Reads and works with projects, people, to-dos, cards, messages, schedules,
-  check-ins, documents, files, search, reports, timesheets, and more.
-- Sends and receives text and attachments.
-- Uses webhooks when available and bounded polling as the safety net.
+Hermes starts a full turn for:
 
-The plugin classifies 195 operations behind eight domain tools. Of the 274
-public methods in `basecamp-sdk` 0.16, 189 are available to agents, six support
-the runtime internally, and 79 are intentionally excluded. The inventory test
-fails when an SDK update introduces an unclassified method.
+- a Ping from a non-client teammate;
+- a structured mention in an allowlisted project;
+- a to-do, card, or card-step assigned to the agent;
+- a follow-up on a recording where the agent is active;
+- a check-in prompt addressed to the agent.
 
-See [`docs/capabilities.md`](docs/capabilities.md) for the complete policy.
+Other project activity is quiet context. Agent-authored events are ignored.
+Ping replies return to the same Circle. Campfire replies return to the same
+Campfire. Recording work uses comments. Check-ins use answers. A successful
+assigned to-do receives a verified result comment before it is completed. A
+failed task stays open.
 
-## The member is the permission model
+Webhook and polling input share one SQLite inbox. Cursor advancement and event
+acceptance are one transaction. Assignment snapshots use durable generations,
+so an agent comment cannot retrigger the same active assignment. Outbound reply
+intents are also durable. After an uncertain network result, the plugin searches
+for canonical agent-authored proof before it retries only the saved write. It
+does not run Hermes again.
 
-The agent can only do what its Basecamp member can do in projects you have
-explicitly allowed. Before work begins, the plugin verifies the configured
-account, person ID, email address, employee role, and project memberships.
-Every resource is then checked against Basecamp before it is read or changed.
+## Public interface
 
-Ordinary changes require a direct Basecamp interaction or an approved
-schedule. Destructive, access-changing, archival, and cross-project actions
-require a fresh approval for that exact action. Unknown operations fail
-closed. A timed-out change is recorded as uncertain and is never retried
-blindly.
+Targets use Basecamp's grammar:
 
-The plugin does not automate Basecamp Adminland. Creating the member, accepting
-an invitation, billing, ownership, account security, and employee or client
-classification remain human work.
+```text
+recording:<id>
+bucket:<id>
+bucket:<bucket_id>/recording:<recording_id>
+ping:<circle_id>
+```
+
+The plugin exposes ten tools:
+
+- `basecamp_create_todo`
+- `basecamp_complete_todo`
+- `basecamp_reopen_todo`
+- `basecamp_read_history`
+- `basecamp_add_boost`
+- `basecamp_move_card`
+- `basecamp_post_message`
+- `basecamp_answer_checkin`
+- `basecamp_api_read`
+- `basecamp_api_write`
+
+The generic tools use a generated, frozen inventory of official SDK routes.
+They still call typed SDK services. They require an explicit project scope and
+reject foreign hosts, query strings in paths, denied projects, unknown routes,
+Adminland operations, and ownership that Basecamp cannot prove.
+
+The policy registry classifies 195 SDK operations. It exposes 189 project-member
+operations through focused or generic tools and denies six Adminland operations.
+The full 274-method SDK inventory also records internal and intentionally
+excluded methods. CI fails on any unclassified SDK change.
 
 ## Install
 
-You need Hermes Agent, Python 3.11 through 3.13, and one dedicated Basecamp
-member for each Hermes agent.
-
-Install the plugin:
+Requirements are Hermes Agent and Python 3.11 through 3.13.
 
 ```sh
 hermes plugins install ScaleLean/hermes-basecamp --enable
-```
-
-Hermes reports the two declared Python dependencies during installation.
-Install them in the same Python environment that runs Hermes if needed:
-
-```sh
 python -m pip install 'basecamp-sdk>=0.16.0,<0.17' 'markdown-it-py>=3,<5'
 ```
 
-Configure the member and the projects it may use:
+Use one configuration per agent:
 
 ```yaml
 gateway:
@@ -77,87 +92,69 @@ gateway:
       person_email: agent@example.com
       mention: "@HermesAgent"
       project_ids: ["11111111"]
-      token_file: /absolute/path/outside/the-repository/agent-oauth.json
+      peer_agent_ids: ["8765432"]
+      token_file: /absolute/path/outside-the-repository/agent-oauth.json
+      webhook_public_url: https://agent.example.com/basecamp/webhooks/SECRET
 ```
 
-Keep OAuth credentials and `BASECAMP_WEBHOOK_TOKEN` in the profile-scoped
-secret environment, not in YAML or this repository. Environment-based
-configuration is documented in [`.env.example`](.env.example).
+Keep OAuth credentials, webhook secrets, and live identifiers outside Git. See
+[`.env.example`](.env.example) for every setting.
 
-Verify the installation, then restart Hermes:
+When two or more agents share a Basecamp account, list every other agent member
+in `peer_agent_ids` or `BASECAMP_PEER_AGENT_IDS`. A peer can start work through
+a structured mention or assignment. Its replies and other implicit follow-ups
+stay quiet, which prevents agent reply loops without breaking human follow-up
+continuity.
+
+## Operator commands
 
 ```sh
-hermes plugins doctor ~/.hermes/plugins/basecamp-platform --ci
-hermes gateway restart
+hermes basecamp setup --public-url https://agent.example.com/basecamp/webhooks/SECRET --yes
+hermes basecamp doctor --probe
+hermes basecamp webhooks sync --yes
+hermes basecamp journal list
+hermes basecamp journal reconcile --help
+hermes basecamp test live --campfire-id ID --todolist-id ID --yes
 ```
 
-## Authorize the member
+Use Hermes's native profile selector for another agent, for example
+`hermes -p agentb basecamp doctor --probe`. The separately installed
+`hermes-basecamp` console script also accepts `--profile agentb`.
 
-Use a separate OAuth grant for every agent. Never reuse a human member's token.
+`test live` requires separate conductor credentials. It does not use the
+agent's OAuth grant to create its own test event. Invitations, access changes,
+archive, trash, and deletion are never part of that suite.
 
-Basecamp accounts that support device authorization can use:
+The receiver binds to loopback. Production uses a stable HTTPS proxy or tunnel.
+Polling remains active when webhooks are available.
 
-```sh
-python scripts/basecamp_oauth.py \
-  --account-id ACCOUNT_ID \
-  --person-id PERSON_ID \
-  --email AGENT_EMAIL \
-  --output /path/outside-repository/agent-oauth.json
-```
+## Health states
 
-Accounts that use Launchpad require a registered OAuth application:
+- `starting`: identity or initial lane probes are incomplete.
+- `ready`: identity, role, every required receive lane, inbox, and webhooks are healthy.
+- `recovering`: one lane or webhook path is degraded while safety-net ingestion continues.
+- `blocked`: identity, OAuth, membership, or configuration prevents operation.
+- `stopped`: the gateway was intentionally disconnected.
 
-```sh
-python scripts/basecamp_launchpad_oauth.py \
-  --app-credentials /path/outside-repository/basecamp-app.json \
-  --account-id ACCOUNT_ID \
-  --person-id PERSON_ID \
-  --email AGENT_EMAIL \
-  --output /path/outside-repository/agent-oauth.json
-```
-
-Both flows verify the selected account, member, and email before writing an
-owner-only token file. Run the read-only identity check at any time with:
-
-```sh
-python scripts/basecamp_doctor.py
-```
-
-## Webhooks
-
-Polling works without a public endpoint. Webhooks make delivery faster.
-
-The built-in receiver binds to loopback by default. Expose it only through a
-trusted HTTPS reverse proxy. A non-loopback bind is rejected unless
-`BASECAMP_WEBHOOK_TLS_PROXY=true` records that protection explicitly.
-
-## Recovery
-
-Every change has an idempotency key and a durable journal. Inspect unresolved
-work after an interruption:
-
-```sh
-hermes-basecamp journal-list --profile-id ACCOUNT_ID:PERSON_ID
-```
-
-A pre-dispatch reservation can be released explicitly. A dispatched or
-uncertain change first requires a Basecamp reconciliation that proves the
-change did not happen. See [`docs/capabilities.md`](docs/capabilities.md) for
-the exact recovery contract.
+`doctor --probe` reports each lane's last success, cursor age, queue depth,
+oldest pending age, poison count, last completed Hermes run, and webhook state.
+Authentication alone never reports `ready`.
 
 ## Development
 
 ```sh
-python -m pytest -q
+python -m pytest -p no:cacheprovider -q
 ruff check .
 mypy --explicit-package-bases .
+python scripts/generate_sdk_routes.py --check
+gitleaks detect --source . --redact --no-banner
 python -m build
 hermes plugins doctor . --ci
 ```
 
-The supported Python versions run in CI. Live tests are opt-in and require a
-dedicated Basecamp test member. The project remains an alpha until its public
-interfaces and field behavior have earned a stable 1.0 promise.
+CI tests Python 3.11, 3.12, and 3.13 against the minimum pinned Hermes revision
+and current Hermes main. See [the architecture](docs/architecture.md),
+[capability policy](docs/capabilities.md), and [1.0 release gate](docs/release-gate.md).
 
 ## License
 

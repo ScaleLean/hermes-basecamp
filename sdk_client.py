@@ -6,6 +6,7 @@ import inspect
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any
 
 try:
@@ -61,6 +62,34 @@ UNSAFE_WEBHOOK_RECORDING_TYPES: dict[str, str] = {
 
 WEBHOOK_CANONICAL_TYPE_ALIASES = {"Client::Forward": "Client::Correspondence"}
 
+NOTIFICATION_APP_ROUTES: tuple[tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r"/buckets/(?P<bucket>\d+)/todos/(?P<recording>\d+)(?:$|[/?#])"), "Todo"),
+    (re.compile(r"/buckets/(?P<bucket>\d+)/card_tables/cards/(?P<recording>\d+)(?:$|[/?#])"), "Kanban::Card"),
+    (re.compile(r"/buckets/(?P<bucket>\d+)/messages/(?P<recording>\d+)(?:$|[/?#])"), "Message"),
+    (re.compile(r"/buckets/(?P<bucket>\d+)/documents/(?P<recording>\d+)(?:$|[/?#])"), "Document"),
+    (re.compile(r"/buckets/(?P<bucket>\d+)/questions/(?P<recording>\d+)(?:$|[/?#])"), "Question"),
+    (re.compile(r"/buckets/(?P<bucket>\d+)/uploads/(?P<recording>\d+)(?:$|[/?#])"), "Upload"),
+)
+CHAT_LINE_APP_ROUTE = re.compile(
+    r"/buckets/(?P<bucket>\d+)/chats/(?P<parent>\d+)@(?P<recording>\d+)(?:$|[/?#])"
+)
+SUBSCRIPTION_RECORDING_ROUTE = re.compile(
+    r"/buckets/(?P<bucket>\d+)/recordings/(?P<recording>\d+)/"
+)
+
+
+def _notification_recording(item: Mapping[str, Any]) -> tuple[str, str, str, str] | None:
+    """Resolve an app notification to a typed SDK recording pointer."""
+    app_url = str(item.get("app_url") or "")
+    chat = CHAT_LINE_APP_ROUTE.search(app_url)
+    if chat:
+        return chat.group("bucket"), chat.group("recording"), "Chat::Line", chat.group("parent")
+    for pattern, record_type in NOTIFICATION_APP_ROUTES:
+        match = pattern.search(app_url)
+        if match:
+            return match.group("bucket"), match.group("recording"), record_type, ""
+    return None
+
 
 @dataclass(frozen=True)
 class ExpectedIdentity:
@@ -102,6 +131,7 @@ class BasecampSDKClient:
             raise BasecampRuntimeError("At least one numeric Basecamp project ID is required")
         self.expected = expected
         self.project_ids = project_ids
+        self._owned_recordings: dict[str, str] = {}
         if token_provider is not None:
             provider = token_provider
         elif credentials is not None and credentials.refreshable:
@@ -186,6 +216,13 @@ class BasecampSDKClient:
         )
         if project_id != expected_project_id or project_id not in self.project_ids:
             raise OwnershipMismatchError("Basecamp canonical resource belongs to a different or denied project")
+        recording_id = str(item.get("id") or "")
+        if recording_id:
+            owned_recordings = getattr(self, "_owned_recordings", None)
+            if owned_recordings is None:
+                owned_recordings = {}
+                self._owned_recordings = owned_recordings
+            owned_recordings[recording_id] = expected_project_id
         return item
 
     async def timeline(self, *, limit_per_project: int | None = None) -> list[Mapping[str, Any]]:
@@ -194,7 +231,11 @@ class BasecampSDKClient:
             result = await self._account.timeline.get_project_timeline(
                 project_id=int(project_id), max_items=limit_per_project
             )
-            events.extend(item for item in result if isinstance(item, Mapping))
+            events.extend(
+                {**item, "_stream_id": f"activity:{project_id}"}
+                for item in result
+                if isinstance(item, Mapping)
+            )
         events.sort(key=lambda item: str(item.get("created_at") or ""), reverse=True)
         return events
 
@@ -236,17 +277,152 @@ class BasecampSDKClient:
                     "bucket": {"id": project_id},
                     "recording": {**line, "type": "Chat::Line"},
                     "parent": {"id": campfire_id},
+                    "_stream_id": f"campfire:{project_id}:{campfire_id}",
                 }
             )
         return events
 
     async def notifications(self) -> list[Mapping[str, Any]]:
+        return await self._notification_events(pings_only=False)
+
+    async def pings(self) -> list[Mapping[str, Any]]:
+        return await self._notification_events(pings_only=True)
+
+    async def resolve_ping_transcript(self, circle_id: str) -> str:
+        """Resolve a Circle to its Ping transcript from authenticated notifications."""
+        if not circle_id.isdigit():
+            raise OwnershipMismatchError("Basecamp Ping Circle ID must be numeric")
+        payload = await self._account.my_notifications.get_my_notifications(limit_bubble_ups=True)
+        for key in ("unreads", "reads", "bubble_ups", "scheduled_bubble_ups"):
+            values = payload.get(key) or []
+            if not isinstance(values, list):
+                continue
+            for item in values:
+                if not isinstance(item, Mapping):
+                    continue
+                if str(item.get("section") or "").lower() != "pings":
+                    continue
+                location = SUBSCRIPTION_RECORDING_ROUTE.search(
+                    str(item.get("subscription_url") or "")
+                )
+                if location is not None and location.group("bucket") == circle_id:
+                    return location.group("recording")
+        raise OwnershipMismatchError("Basecamp Ping transcript could not be resolved")
+
+    async def _notification_events(self, *, pings_only: bool) -> list[Mapping[str, Any]]:
         payload = await self._account.my_notifications.get_my_notifications(limit_bubble_ups=True)
         events: list[Mapping[str, Any]] = []
         for key in ("unreads", "reads", "bubble_ups", "scheduled_bubble_ups"):
             values = payload.get(key) or []
             if isinstance(values, list):
-                events.extend(item for item in values if isinstance(item, Mapping))
+                for item in values:
+                    if not isinstance(item, Mapping):
+                        continue
+                    location = SUBSCRIPTION_RECORDING_ROUTE.search(
+                        str(item.get("subscription_url") or "")
+                    )
+                    section = str(item.get("section") or "").lower()
+                    if section == "pings":
+                        if not pings_only:
+                            continue
+                        if location is None:
+                            continue
+                        bucket_id = location.group("bucket")
+                        recording_id = location.group("recording")
+                        lines = await self._account.campfires.list_lines(
+                            campfire_id=int(recording_id),
+                            sort="created_at",
+                            direction="desc",
+                            max_items=100,
+                        )
+                        for line in lines:
+                            if not isinstance(line, Mapping):
+                                continue
+                            events.append(
+                                {
+                                    "id": line.get("id"),
+                                    "kind": "ping_line_created",
+                                    "created_at": line.get("created_at"),
+                                    "creator": line.get("creator"),
+                                    "bucket": {"id": bucket_id, "type": "Circle"},
+                                    "recording": {**line, "type": "Chat::Line"},
+                                    "parent": {"id": recording_id, "type": "Chat::Transcript"},
+                                    "participants": item.get("participants") or [],
+                                    "_stream_id": f"ping:{bucket_id}",
+                                }
+                            )
+                        continue
+                    if pings_only:
+                        continue
+                    resolved = _notification_recording(item)
+                    if resolved is None:
+                        continue
+                    bucket_id, recording_id, recording_type, parent_id = resolved
+                    if bucket_id not in self.project_ids:
+                        continue
+                    event = {
+                        "id": item.get("id"),
+                        "kind": f"notification_{item.get('section') or 'inbox'}",
+                        "created_at": item.get("updated_at") or item.get("created_at"),
+                        "creator": item.get("creator"),
+                        "bucket": {"id": bucket_id, "type": "Project"},
+                        "recording": {"id": recording_id, "type": recording_type},
+                        "_stream_id": "notifications",
+                        "_notification_section": item.get("section"),
+                    }
+                    if parent_id:
+                        event["parent"] = {"id": parent_id, "type": "Chat::Transcript"}
+                    events.append(event)
+        return events
+
+    async def assignments(self) -> list[Mapping[str, Any]]:
+        """Return active assignments as normalized synthetic activity events."""
+        payload = await self._account.my_assignments.get_my_assignments()
+        values: list[Mapping[str, Any]] = []
+        for key in ("priorities", "non_priorities"):
+            group = payload.get(key) or []
+            if isinstance(group, list):
+                values.extend(item for item in group if isinstance(item, Mapping))
+        events: list[Mapping[str, Any]] = []
+        for item in values:
+            bucket = item.get("bucket") or {}
+            project_id = str(bucket.get("id") or "") if isinstance(bucket, Mapping) else ""
+            if project_id not in self.project_ids:
+                continue
+            recording_id = str(item.get("id") or "")
+            if not recording_id:
+                continue
+            updated_at = item.get("updated_at") or item.get("created_at") or item.get("due_on") or ""
+            raw_type = str(item.get("type") or "")
+            canonical_type = {
+                "todo": "Todo",
+                "card": "Kanban::Card",
+                "kanban::card": "Kanban::Card",
+                "step": "Kanban::Step",
+                "kanban::step": "Kanban::Step",
+            }.get(raw_type.lower(), raw_type)
+            canonical = await self._get_webhook_recording(canonical_type, int(recording_id))
+            if canonical is None:
+                continue
+            canonical = self._require_owned(canonical, project_id)
+            updated_at = (
+                canonical.get("updated_at")
+                or canonical.get("created_at")
+                or canonical.get("due_on")
+                or updated_at
+            )
+            events.append(
+                {
+                    "id": f"assignment:{recording_id}",
+                    "kind": "assignment_created",
+                    "created_at": updated_at,
+                    "creator": canonical.get("creator") or item.get("creator") or {},
+                    "bucket": dict(bucket),
+                    "recording": {**canonical, "type": canonical_type},
+                    "assignees": canonical.get("assignees") or item.get("assignees") or [],
+                    "_stream_id": "assignments",
+                }
+            )
         return events
 
     async def fetch_recording(self, raw_event: Mapping[str, Any]) -> Mapping[str, Any] | None:
@@ -262,6 +438,21 @@ class BasecampSDKClient:
         expected_project_id = (
             str(bucket.get("id") or raw_event.get("bucket_id") or "") if isinstance(bucket, Mapping) else ""
         )
+        bucket_type = str(bucket.get("type") or "") if isinstance(bucket, Mapping) else ""
+        if bucket_type == "Circle" and record_type == "Chat::Line":
+            parent_id = int(parent.get("id") or 0) if isinstance(parent, Mapping) else 0
+            if not parent_id:
+                return None
+            ping_result = await self._account.campfires.get_line(campfire_id=parent_id, line_id=recording_id)
+            result_bucket = ping_result.get("bucket") or {} if isinstance(ping_result, Mapping) else {}
+            if (
+                not isinstance(ping_result, Mapping)
+                or not isinstance(result_bucket, Mapping)
+                or str(result_bucket.get("id") or "") != expected_project_id
+                or str(result_bucket.get("type") or "") != "Circle"
+            ):
+                raise OwnershipMismatchError("Basecamp Ping line does not belong to the expected Circle")
+            return ping_result
         if expected_project_id not in self.project_ids:
             raise OwnershipMismatchError("Basecamp event project is not allowlisted")
         result: Mapping[str, Any] | None = await self._get_webhook_recording(record_type, recording_id)
@@ -348,24 +539,88 @@ class BasecampSDKClient:
         }
 
     async def post_chat(self, project_id: str, room_id: str, content: str) -> Mapping[str, Any]:
-        if project_id not in self.project_ids:
-            raise OwnershipMismatchError("Basecamp Campfire project is not allowlisted")
-        room = await self._account.campfires.get(campfire_id=int(room_id))
-        self._require_owned(room, project_id)
+        if project_id in self.project_ids:
+            room = await self._account.campfires.get(campfire_id=int(room_id))
+            bucket = room.get("bucket") or {}
+            actual_id = str(bucket.get("id") or "") if isinstance(bucket, Mapping) else ""
+            if actual_id != project_id:
+                raise OwnershipMismatchError("Basecamp chat belongs to a different bucket")
+        else:
+            transcript_id = await self.resolve_ping_transcript(project_id)
+            if transcript_id != room_id:
+                raise OwnershipMismatchError("Basecamp Ping transcript belongs to a different Circle")
         return await self._account.campfires.create_line(
             campfire_id=int(room_id), content=content, content_type="text/html"
         )
 
+    async def resolve_target(
+        self, recording_id: str, expected_project_id: str = ""
+    ) -> tuple[str, str]:
+        """Resolve an official recording target to its typed write surface and project."""
+        if not recording_id.isdigit():
+            raise OwnershipMismatchError("Basecamp recording target must be numeric")
+        cached_project = getattr(self, "_owned_recordings", {}).get(recording_id, "")
+        if cached_project:
+            if expected_project_id and cached_project != expected_project_id:
+                raise OwnershipMismatchError("Basecamp recording target is outside the requested project")
+            return "recording", cached_project
+        try:
+            room = await self._account.campfires.get(campfire_id=int(recording_id))
+        except Exception as exc:
+            status = (
+                getattr(exc, "status_code", None)
+                or getattr(exc, "status", None)
+                or getattr(exc, "http_status", None)
+            )
+            if status != 404 and getattr(exc, "code", None) != "not_found":
+                raise
+        else:
+            bucket = room.get("bucket") or {} if isinstance(room, Mapping) else {}
+            project_id = str(bucket.get("id") or "") if isinstance(bucket, Mapping) else ""
+            if project_id not in self.project_ids or (expected_project_id and project_id != expected_project_id):
+                raise OwnershipMismatchError("Basecamp Campfire target is outside the requested project")
+            return "chat", project_id
+
+        attempted: set[tuple[str, str, str]] = set()
+        for service_name, method_name, argument_name in SAFE_WEBHOOK_RECORDING_GETTERS.values():
+            signature = (service_name, method_name, argument_name)
+            if signature in attempted:
+                continue
+            attempted.add(signature)
+            try:
+                result = await getattr(getattr(self._account, service_name), method_name)(
+                    **{argument_name: int(recording_id)}
+                )
+            except Exception as exc:
+                status = (
+                    getattr(exc, "status_code", None)
+                    or getattr(exc, "status", None)
+                    or getattr(exc, "http_status", None)
+                )
+                if status == 404 or getattr(exc, "code", None) == "not_found":
+                    continue
+                raise
+            if not isinstance(result, Mapping) or str(result.get("id") or "") != recording_id:
+                continue
+            bucket = result.get("bucket") or {}
+            project_id = str(bucket.get("id") or "") if isinstance(bucket, Mapping) else ""
+            if project_id not in self.project_ids or (expected_project_id and project_id != expected_project_id):
+                raise OwnershipMismatchError("Basecamp recording target is outside the requested project")
+            self._require_owned(result, project_id)
+            return "recording", project_id
+        raise OwnershipMismatchError("Basecamp recording target could not be resolved through the SDK")
+
     async def post_comment(self, project_id: str, recording_id: str, content: str) -> Mapping[str, Any]:
         if project_id not in self.project_ids:
             raise OwnershipMismatchError("Basecamp recording project is not allowlisted")
-        events = await self._account.events.list(recording_id=int(recording_id), max_items=100)
-        if not events or any(
-            not isinstance(event, Mapping)
-            or str((event.get("bucket") or {}).get("id") or event.get("bucket_id") or "") != project_id
-            for event in events
-        ):
-            raise OwnershipMismatchError("Basecamp recording event history does not prove project ownership")
+        if getattr(self, "_owned_recordings", {}).get(recording_id) != project_id:
+            events = await self._account.events.list(recording_id=int(recording_id), max_items=100)
+            if not events or any(
+                not isinstance(event, Mapping)
+                or str((event.get("bucket") or {}).get("id") or event.get("bucket_id") or "") != project_id
+                for event in events
+            ):
+                raise OwnershipMismatchError("Basecamp recording event history does not prove project ownership")
         return await self._account.comments.create(recording_id=int(recording_id), content=content)
 
     async def verify_chat_authorship(self, room_id: str, line_id: str) -> Mapping[str, Any]:
@@ -374,6 +629,52 @@ class BasecampSDKClient:
 
     async def verify_comment_authorship(self, comment_id: str) -> Mapping[str, Any]:
         return self._verify_creator(await self._account.comments.get(comment_id=int(comment_id)))
+
+    async def reconcile_delivery(
+        self,
+        target_type: str,
+        target_id: str,
+        content: str,
+        *,
+        item_id: str = "",
+        not_before: float = 0,
+    ) -> Mapping[str, Any] | None:
+        """Find canonical proof for an uncertain reply without creating another write."""
+        if item_id:
+            try:
+                if target_type == "chat":
+                    return await self.verify_chat_authorship(target_id, item_id)
+                if target_type == "question":
+                    return self.verify_creator(
+                        await self._account.checkins.get_answer(answer_id=int(item_id))
+                    )
+                return await self.verify_comment_authorship(item_id)
+            except Exception as exc:
+                status = getattr(exc, "status_code", None) or getattr(exc, "status", None)
+                if status != 404 and getattr(exc, "code", None) != "not_found":
+                    raise
+        if target_type == "chat":
+            items = await self._account.campfires.list_lines(campfire_id=int(target_id), max_items=100)
+        elif target_type == "question":
+            items = await self._account.checkins.list_answers(question_id=int(target_id), max_items=100)
+        else:
+            items = await self._account.comments.list(recording_id=int(target_id), max_items=100)
+        matches = []
+        for item in items:
+            if not isinstance(item, Mapping) or str(item.get("content") or "") != content:
+                continue
+            created_at = str(item.get("created_at") or "")
+            if not_before:
+                try:
+                    created_timestamp = datetime.fromisoformat(created_at).timestamp()
+                except ValueError:
+                    continue
+                if created_timestamp < not_before - 120:
+                    continue
+            creator = item.get("creator") or {}
+            if isinstance(creator, Mapping) and str(creator.get("id") or "") == self.expected.person_id:
+                matches.append(item)
+        return matches[-1] if matches else None
 
     def _verify_creator(self, item: Mapping[str, Any]) -> Mapping[str, Any]:
         creator = item.get("creator") or {}
@@ -384,3 +685,7 @@ class BasecampSDKClient:
                 f"got {creator_id or 'missing'}"
             )
         return item
+
+    def verify_creator(self, item: Mapping[str, Any]) -> Mapping[str, Any]:
+        """Verify that a canonical read-back was authored by this agent member."""
+        return self._verify_creator(item)

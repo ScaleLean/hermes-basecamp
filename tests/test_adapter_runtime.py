@@ -10,10 +10,319 @@ from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import ProcessingOutcome, SendResult
 
 from adapter import BasecampAdapter, _standalone_send
+from delivery_journal import DeliveryJournal
 from webhook_ingress import DurableWebhookStore, WebhookIngress
 
 
 class AdapterRuntimeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_one_todo_assignment_dispatches_once_across_activity_and_snapshot_lanes(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            canonical = {
+                "id": 49,
+                "type": "Todo",
+                "title": "Assignment canary",
+                "creator": {"id": 8, "name": "Peer Agent", "client": False},
+                "assignees": [{"id": 7}],
+                "bucket": {"id": 10},
+                "parent": {"id": 30, "type": "Todolist"},
+            }
+            client = SimpleNamespace(
+                project_ids=("10",),
+                expected=SimpleNamespace(account_id="1", person_id="7"),
+                fetch_recording=AsyncMock(return_value=canonical),
+                call=AsyncMock(return_value={"id": 49, "completed": True, "bucket": {"id": 10}}),
+            )
+            config = PlatformConfig(
+                extra={
+                    "account_id": "1",
+                    "person_id": "7",
+                    "person_email": "agent@example.com",
+                    "mention": "@agent",
+                    "project_ids": ["10"],
+                    "peer_agent_ids": ["8"],
+                    "access_token": "test",
+                }
+            )
+            with (
+                patch("adapter._make_client", return_value=client),
+                patch("adapter.default_replay_path", return_value=root / "replay.json"),
+                patch("adapter.configured_media_roots", return_value=(root,)),
+                patch("adapter.configured_inbound_media_root", return_value=root),
+                patch("adapter.Platform", return_value=next(iter(Platform))),
+            ):
+                adapter = BasecampAdapter(config)
+            adapter._bootstrapped = True
+            adapter._poller.collect = AsyncMock(
+                return_value=[
+                    {
+                        "id": 81,
+                        "kind": "todo_created",
+                        "created_at": "2026-09-04T01:00:00Z",
+                        "creator": canonical["creator"],
+                        "bucket": canonical["bucket"],
+                        "recording": canonical,
+                        "parent": canonical["parent"],
+                    },
+                    {
+                        "id": 82,
+                        "kind": "todo_assignment_changed",
+                        "created_at": "2026-09-04T01:00:01Z",
+                        "creator": canonical["creator"],
+                        "bucket": canonical["bucket"],
+                        "recording": canonical,
+                        "parent": canonical["parent"],
+                    },
+                    {
+                        "id": "assignment:49",
+                        "kind": "assignment_created",
+                        "created_at": "2026-09-04T01:00:02Z",
+                        "creator": canonical["creator"],
+                        "bucket": canonical["bucket"],
+                        "recording": canonical,
+                    },
+                ]
+            )
+
+            async def complete(event):
+                adapter._inbox.activate("10", "49")
+                adapter._verified_deliveries.add(str(event.message_id))
+                await adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
+
+            adapter.handle_message = AsyncMock(side_effect=complete)
+
+            await adapter._poll_once()
+
+            adapter.handle_message.assert_awaited_once()
+            event = adapter.handle_message.await_args.args[0]
+            self.assertEqual(event.message_id, "assignment:49")
+            self.assertEqual(event.source.chat_id, "bucket:10/recording:49")
+            self.assertEqual(adapter._inbox.stats()["depth"], 0)
+
+    async def test_peer_agent_reply_does_not_dispatch_on_active_campfire(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            canonical = {
+                "id": 49,
+                "type": "Chat::Line",
+                "content": "I received the canary.",
+                "creator": {"id": 8, "name": "Peer Agent", "client": False},
+                "bucket": {"id": 10},
+            }
+            client = SimpleNamespace(
+                project_ids=("10",),
+                expected=SimpleNamespace(account_id="1", person_id="7"),
+                fetch_recording=AsyncMock(return_value=canonical),
+            )
+            config = PlatformConfig(
+                extra={
+                    "account_id": "1",
+                    "person_id": "7",
+                    "person_email": "agent@example.com",
+                    "mention": "@agent",
+                    "project_ids": ["10"],
+                    "peer_agent_ids": ["8"],
+                    "access_token": "test",
+                }
+            )
+            with (
+                patch("adapter._make_client", return_value=client),
+                patch("adapter.default_replay_path", return_value=root / "replay.json"),
+                patch("adapter.configured_media_roots", return_value=(root,)),
+                patch("adapter.configured_inbound_media_root", return_value=root),
+                patch("adapter.Platform", return_value=next(iter(Platform))),
+            ):
+                adapter = BasecampAdapter(config)
+            adapter._bootstrapped = True
+            adapter._inbox.activate("10", "30")
+            adapter._poller.collect = AsyncMock(
+                return_value=[
+                    {
+                        "id": 91,
+                        "kind": "chat_line_created",
+                        "created_at": "2026-09-04T01:00:00Z",
+                        "creator": {"id": 8, "name": "Peer Agent", "client": False},
+                        "bucket": {"id": 10},
+                        "recording": {"id": 49, "type": "Chat::Line", "content": "I received the canary."},
+                        "parent": {"id": 30, "type": "Chat::Transcript"},
+                    }
+                ]
+            )
+            adapter.handle_message = AsyncMock()
+
+            await adapter._poll_once()
+
+            adapter.handle_message.assert_not_awaited()
+            self.assertEqual(adapter._inbox.stats()["depth"], 0)
+
+    async def test_ping_preserves_typed_pointer_when_canonical_line_omits_type(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            canonical = {
+                "id": 51,
+                "content": "Ping canary. Reply exactly PING_GREEN.",
+                "creator": {"id": 8, "name": "Member", "client": False},
+                "bucket": {"id": 55, "type": "Circle"},
+            }
+            client = SimpleNamespace(
+                project_ids=("10",),
+                expected=SimpleNamespace(account_id="1", person_id="7"),
+                attest_full_member=AsyncMock(),
+                fetch_recording=AsyncMock(return_value=canonical),
+                post_chat=AsyncMock(return_value={"id": 90}),
+                verify_chat_authorship=AsyncMock(
+                    return_value={"id": 90, "creator": {"id": 7}}
+                ),
+            )
+            config = PlatformConfig(
+                extra={
+                    "account_id": "1",
+                    "person_id": "7",
+                    "person_email": "agent@example.com",
+                    "mention": "@agent",
+                    "project_ids": ["10"],
+                    "access_token": "test",
+                }
+            )
+            with (
+                patch("adapter._make_client", return_value=client),
+                patch("adapter.default_replay_path", return_value=root / "replay.json"),
+                patch("adapter.configured_media_roots", return_value=(root,)),
+                patch("adapter.configured_inbound_media_root", return_value=root),
+                patch("adapter.Platform", return_value=next(iter(Platform))),
+            ):
+                adapter = BasecampAdapter(config)
+            adapter._bootstrapped = True
+            adapter._poller.collect = AsyncMock(
+                return_value=[
+                    {
+                        "id": 51,
+                        "kind": "ping_line_created",
+                        "created_at": "2026-09-04T01:00:00Z",
+                        "creator": canonical["creator"],
+                        "bucket": canonical["bucket"],
+                        "recording": {**canonical, "type": "Chat::Line"},
+                        "parent": {"id": 66, "type": "Chat::Transcript"},
+                        "participants": [{"id": 8}],
+                    }
+                ]
+            )
+
+            async def reply(event):
+                await adapter.send(event.source.chat_id, "PING_GREEN")
+                await adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
+
+            adapter.handle_message = AsyncMock(side_effect=reply)
+
+            await adapter._poll_once()
+
+            adapter.handle_message.assert_awaited_once()
+            client.post_chat.assert_awaited_once_with("55", "66", "<div>PING_GREEN</div>")
+            self.assertEqual(adapter._inbox.stats()["depth"], 0)
+
+    async def test_ping_send_resolves_transcript_when_runtime_cache_is_empty(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            client = SimpleNamespace(
+                project_ids=("10",),
+                expected=SimpleNamespace(account_id="1", person_id="7"),
+                attest_full_member=AsyncMock(),
+                resolve_ping_transcript=AsyncMock(return_value="66"),
+                post_chat=AsyncMock(return_value={"id": 90}),
+                verify_chat_authorship=AsyncMock(
+                    return_value={"id": 90, "creator": {"id": 7}}
+                ),
+            )
+            config = PlatformConfig(
+                extra={
+                    "account_id": "1",
+                    "person_id": "7",
+                    "person_email": "agent@example.com",
+                    "mention": "@agent",
+                    "project_ids": ["10"],
+                    "access_token": "test",
+                }
+            )
+            with (
+                patch("adapter._make_client", return_value=client),
+                patch("adapter.default_replay_path", return_value=root / "replay.json"),
+                patch("adapter.configured_media_roots", return_value=(root,)),
+                patch("adapter.configured_inbound_media_root", return_value=root),
+                patch("adapter.Platform", return_value=next(iter(Platform))),
+            ):
+                adapter = BasecampAdapter(config)
+
+            result = await adapter.send("ping:55", "PING_GREEN")
+
+            self.assertTrue(result.success)
+            client.resolve_ping_transcript.assert_awaited_once_with("55")
+            client.post_chat.assert_awaited_once_with("55", "66", "<div>PING_GREEN</div>")
+
+    async def test_uncertain_reply_reconciles_without_a_second_write(self):
+        with tempfile.TemporaryDirectory() as temp:
+            adapter = object.__new__(BasecampAdapter)
+            adapter._deliveries = DeliveryJournal(Path(temp) / "deliveries.sqlite3")
+            adapter._deliveries.reserve(
+                event_id="event-1", sequence=0, chat_id="recording:40",
+                target_type="recording", project_id="10", target_id="40", content="result",
+            )
+            adapter._deliveries.transition("event-1", 0, "dispatched")
+            delivery = adapter._deliveries.pending("event-1")[0]
+            adapter._client = SimpleNamespace(
+                reconcile_delivery=AsyncMock(
+                    return_value={"id": 50, "content": "result", "creator": {"id": 7}}
+                ),
+                post_comment=AsyncMock(),
+            )
+
+            item_id = await adapter._deliver_reserved(delivery, reconcile_first=True)
+
+            self.assertEqual(item_id, "50")
+            adapter._client.post_comment.assert_not_awaited()
+            self.assertEqual(adapter._deliveries.pending("event-1"), ())
+
+    async def test_durable_final_failure_is_accepted_for_plugin_reconciliation(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            client = SimpleNamespace(
+                project_ids=("10",),
+                expected=SimpleNamespace(account_id="1", person_id="7"),
+                attest_full_member=AsyncMock(),
+                resolve_target=AsyncMock(return_value=("recording", "10")),
+                post_comment=AsyncMock(side_effect=RuntimeError("write outcome is uncertain")),
+            )
+            config = PlatformConfig(
+                extra={
+                    "account_id": "1",
+                    "person_id": "7",
+                    "person_email": "agent@example.com",
+                    "mention": "@agent",
+                    "project_ids": ["10"],
+                    "access_token": "test",
+                }
+            )
+            with (
+                patch("adapter._make_client", return_value=client),
+                patch("adapter.default_replay_path", return_value=root / "replay.json"),
+                patch("adapter.configured_media_roots", return_value=(root,)),
+                patch("adapter.configured_inbound_media_root", return_value=root),
+                patch("adapter.Platform", return_value=next(iter(Platform))),
+            ):
+                adapter = BasecampAdapter(config)
+            chat_id = "bucket:10/recording:49"
+            adapter._active_dispatches[chat_id] = "event-1"
+            adapter._delivery_sequences["event-1"] = 0
+
+            result = await adapter.send(chat_id, "one durable reply")
+
+            self.assertTrue(result.success)
+            self.assertEqual(result.raw_response, {"delivery_pending": True})
+            pending = adapter._deliveries.pending("event-1")
+            self.assertEqual(len(pending), 1)
+            self.assertEqual(pending[0].target_type, "recording")
+            self.assertEqual(pending[0].state, "uncertain")
+            client.post_comment.assert_awaited_once()
+
     async def test_connect_and_disconnect_recover_webhook_leases(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -90,6 +399,7 @@ class AdapterRuntimeTests(unittest.IsolatedAsyncioTestCase):
             )
 
             async def complete(event):
+                adapter._verified_deliveries.add(str(event.message_id))
                 await adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
 
             adapter.handle_message = AsyncMock(side_effect=complete)
@@ -99,6 +409,50 @@ class AdapterRuntimeTests(unittest.IsolatedAsyncioTestCase):
 
             adapter.handle_message.assert_not_awaited()
             client.fetch_recording.assert_not_awaited()
+
+    async def test_startup_restore_keeps_events_in_inbox_without_dispatch(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            client = SimpleNamespace(
+                project_ids=("10",),
+                expected=SimpleNamespace(account_id="1", person_id="7"),
+            )
+            config = PlatformConfig(
+                extra={
+                    "account_id": "1",
+                    "person_id": "7",
+                    "person_email": "agent@example.com",
+                    "mention": "@agent",
+                    "project_ids": ["10"],
+                    "access_token": "test",
+                }
+            )
+            with (
+                patch("adapter._make_client", return_value=client),
+                patch("adapter.default_replay_path", return_value=root / "replay.json"),
+                patch("adapter.configured_media_roots", return_value=(root,)),
+                patch("adapter.configured_inbound_media_root", return_value=root),
+                patch("adapter.Platform", return_value=next(iter(Platform))),
+            ):
+                adapter = BasecampAdapter(config)
+            adapter._bootstrapped = True
+            adapter.gateway_runner = SimpleNamespace(_startup_restore_in_progress=True)
+            adapter._poller.collect = AsyncMock(
+                return_value=[
+                    {
+                        "id": 12,
+                        "creator": {"id": 8},
+                        "bucket": {"id": 10},
+                        "recording": {"id": 49, "type": "Todo", "assignees": [{"id": 7}]},
+                    }
+                ]
+            )
+            adapter.handle_message = AsyncMock()
+
+            await adapter._poll_once()
+
+            adapter.handle_message.assert_not_awaited()
+            self.assertEqual(adapter._inbox.stats()["depth"], 1)
 
     async def test_poison_event_does_not_abort_later_event(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -142,6 +496,7 @@ class AdapterRuntimeTests(unittest.IsolatedAsyncioTestCase):
             client.fetch_recording = AsyncMock(side_effect=[RuntimeError("poison"), raw(2)["recording"]])
 
             async def complete(event):
+                adapter._verified_deliveries.add(str(event.message_id))
                 await adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
 
             adapter.handle_message = AsyncMock(side_effect=complete)
@@ -198,19 +553,184 @@ class AdapterRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 return "completed reply"
 
             adapter._message_handler = delayed_handler
-            adapter.send = AsyncMock(return_value=SendResult(success=True, message_id="reply-1"))
+
+            async def verified_send(chat_id, *_args, **_kwargs):
+                adapter._verified_deliveries.add(adapter._active_dispatches[chat_id])
+                return SendResult(success=True, message_id="reply-1")
+
+            adapter.send = AsyncMock(side_effect=verified_send)
             task = asyncio.create_task(adapter._poll_once())
-            for _ in range(20):
-                await asyncio.sleep(0.01)
-                if adapter._replay.path.exists():
-                    break
-            state = json.loads(adapter._replay.path.read_text())
+            async with asyncio.timeout(2):
+                while not adapter._replay.path.exists():
+                    await asyncio.sleep(0.01)
+                while True:
+                    state = json.loads(adapter._replay.path.read_text())
+                    if "9" in state["pending"]:
+                        break
+                    await asyncio.sleep(0.01)
             self.assertIn("9", state["pending"])
             self.assertNotIn("9", state["committed"])
             delivered.set()
             await task
             state = json.loads(adapter._replay.path.read_text())
             self.assertIn("9", state["committed"])
+
+    async def test_assignment_dispatch_uses_canonical_creator(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            canonical = {
+                "id": 49,
+                "type": "Todo",
+                "title": "Test the integration",
+                "creator": {"id": 8, "name": "Member", "client": False},
+                "assignees": [{"id": 7}],
+                "bucket": {"id": 10},
+            }
+            client = SimpleNamespace(
+                project_ids=("10",),
+                expected=SimpleNamespace(account_id="1", person_id="7"),
+                fetch_recording=AsyncMock(return_value=canonical),
+                call=AsyncMock(return_value={"id": 49, "completed": True, "bucket": {"id": 10}}),
+                post_comment=AsyncMock(return_value={"id": 90}),
+                verify_comment_authorship=AsyncMock(return_value={"id": 90, "creator": {"id": 7}}),
+            )
+            config = PlatformConfig(
+                extra={
+                    "account_id": "1",
+                    "person_id": "7",
+                    "person_email": "agent@example.com",
+                    "mention": "@agent",
+                    "project_ids": ["10"],
+                    "access_token": "test",
+                }
+            )
+            with (
+                patch("adapter._make_client", return_value=client),
+                patch("adapter.default_replay_path", return_value=root / "replay.json"),
+                patch("adapter.configured_media_roots", return_value=(root,)),
+                patch("adapter.configured_inbound_media_root", return_value=root),
+                patch("adapter.Platform", return_value=next(iter(Platform))),
+            ):
+                adapter = BasecampAdapter(config)
+            adapter._bootstrapped = True
+            adapter._poller.collect = AsyncMock(
+                return_value=[
+                    {
+                        "id": "assignment:49",
+                        "kind": "assignment_created",
+                        "creator": {"id": "basecamp", "name": "Basecamp"},
+                        "bucket": {"id": 10},
+                        "recording": {"id": 49, "type": "Todo", "assignees": [{"id": 7}]},
+                    }
+                ]
+            )
+            seen_sources = []
+
+            async def handle(event):
+                seen_sources.append(event.source)
+                adapter._verified_deliveries.add(str(event.message_id))
+                await adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
+
+            adapter.handle_message = AsyncMock(side_effect=handle)
+
+            await adapter._poll_once()
+
+            self.assertEqual([source.user_id for source in seen_sources], ["8"])
+            self.assertTrue(seen_sources[0].role_authorized)
+
+            client.call.reset_mock()
+            adapter._poller.collect.return_value[0]["id"] = "assignment:49:no-reply"
+
+            async def no_reply(event):
+                await adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
+
+            adapter.handle_message.side_effect = no_reply
+            await adapter._poll_once()
+
+            client.call.assert_not_awaited()
+            client.post_comment.assert_awaited_once()
+
+    async def test_comment_reply_uses_parent_recording_not_campfire(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            mention = (
+                '<bc-attachment content-type="application/vnd.basecamp.mention" '
+                'sgid="sgid://bc3/Person/7"></bc-attachment>'
+            )
+            canonical = {
+                "id": 51,
+                "type": "Comment",
+                "title": "Re: Assignment canary: reply exactly ASSIGNMENT_DONE",
+                "content": f"{mention} Follow up on this to-do.",
+                "creator": {"id": 8, "name": "Member", "client": False},
+                "bucket": {"id": 10},
+            }
+            client = SimpleNamespace(
+                project_ids=("10",),
+                expected=SimpleNamespace(account_id="1", person_id="7"),
+                attest_full_member=AsyncMock(),
+                fetch_recording=AsyncMock(return_value=canonical),
+                resolve_target=AsyncMock(return_value=("recording", "10")),
+                post_comment=AsyncMock(return_value={"id": 90}),
+                verify_comment_authorship=AsyncMock(
+                    return_value={"id": 90, "creator": {"id": 7}}
+                ),
+                post_chat=AsyncMock(return_value={"id": 91}),
+                verify_chat_authorship=AsyncMock(
+                    return_value={"id": 91, "creator": {"id": 7}}
+                ),
+            )
+            config = PlatformConfig(
+                extra={
+                    "account_id": "1",
+                    "person_id": "7",
+                    "person_email": "agent@example.com",
+                    "mention": "@agent",
+                    "project_ids": ["10"],
+                    "access_token": "test",
+                }
+            )
+            with (
+                patch("adapter._make_client", return_value=client),
+                patch("adapter.default_replay_path", return_value=root / "replay.json"),
+                patch("adapter.configured_media_roots", return_value=(root,)),
+                patch("adapter.configured_inbound_media_root", return_value=root),
+                patch("adapter.Platform", return_value=next(iter(Platform))),
+            ):
+                adapter = BasecampAdapter(config)
+            adapter._bootstrapped = True
+            adapter._poller.collect = AsyncMock(
+                return_value=[
+                    {
+                        "id": 81,
+                        "kind": "comment_created",
+                        "created_at": "2026-09-04T01:00:00Z",
+                        "creator": canonical["creator"],
+                        "bucket": canonical["bucket"],
+                        "recording": canonical,
+                        "parent": {"id": 49, "type": "Todo"},
+                    }
+                ]
+            )
+
+            received_text = []
+
+            async def reply(event):
+                received_text.append(event.text)
+                await adapter.send(event.source.chat_id, "FOLLOWUP_DONE")
+                await adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
+
+            adapter.handle_message = AsyncMock(side_effect=reply)
+
+            await adapter._poll_once()
+
+            adapter.handle_message.assert_awaited_once()
+            self.assertIn("Follow up on this to-do.", received_text[0])
+            self.assertNotIn("ASSIGNMENT_DONE", received_text[0])
+            client.resolve_target.assert_awaited_once_with("49", "10")
+            client.post_comment.assert_awaited_once_with("10", "49", "<div>FOLLOWUP_DONE</div>")
+            client.post_chat.assert_not_awaited()
+            self.assertEqual(adapter._inbox.stats()["depth"], 0)
 
     async def test_native_media_send_uses_attachment_markup_and_verified_target(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -244,7 +764,8 @@ class AdapterRuntimeTests(unittest.IsolatedAsyncioTestCase):
             ):
                 adapter = BasecampAdapter(config)
 
-            result = await adapter.send_image_file("chat:10:30", str(image), "Proof")
+            adapter._chat_transcripts["bucket:10/recording:30"] = "30"
+            result = await adapter.send_image_file("bucket:10/recording:30", str(image), "Proof")
 
             self.assertTrue(result.success)
             sent = client.post_chat.await_args.args[2]
@@ -404,6 +925,7 @@ class AdapterRuntimeTests(unittest.IsolatedAsyncioTestCase):
             )
 
             async def complete(event):
+                adapter._verified_deliveries.add(str(event.message_id))
                 await adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
 
             adapter.handle_message = AsyncMock(side_effect=complete)
@@ -423,6 +945,11 @@ class AdapterRuntimeTests(unittest.IsolatedAsyncioTestCase):
             post_comment=AsyncMock(return_value={"id": 72}),
             verify_chat_authorship=AsyncMock(return_value={"id": 71, "creator": {"id": 7}}),
             verify_comment_authorship=AsyncMock(return_value={"id": 72, "creator": {"id": 7}}),
+            resolve_target=AsyncMock(
+                side_effect=lambda recording_id, _project_id="": (
+                    ("chat", "10") if recording_id == "30" else ("recording", "10")
+                )
+            ),
         )
         config = PlatformConfig(
             extra={
@@ -442,7 +969,11 @@ class AdapterRuntimeTests(unittest.IsolatedAsyncioTestCase):
             patch("adapter.Platform", return_value=next(iter(Platform))),
         ):
             adapter = BasecampAdapter(config)
-            for target, expected_id in (("chat:10:30", "71"), ("recording:10:40", "72")):
+            adapter._chat_transcripts["bucket:10/recording:30"] = "30"
+            for target, expected_id in (
+                ("bucket:10/recording:30", "71"),
+                ("bucket:10/recording:40", "72"),
+            ):
                 with self.subTest(target=target):
                     direct = await adapter.send(target, "Hello")
                     self.assertTrue(direct.success)
@@ -450,8 +981,11 @@ class AdapterRuntimeTests(unittest.IsolatedAsyncioTestCase):
                     standalone = await _standalone_send(config, target, "Hello")
                     self.assertEqual(standalone["message_id"], expected_id)
             client.post_chat.side_effect = RuntimeError("write failed")
-            self.assertFalse((await adapter.send("chat:10:30", "Fail")).success)
-            self.assertIn("write failed", (await _standalone_send(config, "chat:10:30", "Fail"))["error"])
+            self.assertFalse((await adapter.send("bucket:10/recording:30", "Fail")).success)
+            self.assertIn(
+                "write failed",
+                (await _standalone_send(config, "bucket:10/recording:30", "Fail"))["error"],
+            )
         client.post_chat.assert_any_await("10", "30", "<div>Hello</div>")
         client.post_comment.assert_any_await("10", "40", "<div>Hello</div>")
         client.verify_chat_authorship.assert_awaited_with("30", "71")
