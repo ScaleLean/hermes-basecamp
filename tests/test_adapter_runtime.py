@@ -505,6 +505,82 @@ class AdapterRuntimeTests(unittest.IsolatedAsyncioTestCase):
             client.call.assert_not_awaited()
             client.post_comment.assert_awaited_once()
 
+    async def test_comment_reply_uses_parent_recording_not_campfire(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            mention = (
+                '<bc-attachment content-type="application/vnd.basecamp.mention" '
+                'sgid="sgid://bc3/Person/7"></bc-attachment>'
+            )
+            canonical = {
+                "id": 51,
+                "type": "Comment",
+                "content": f"{mention} Follow up on this to-do.",
+                "creator": {"id": 8, "name": "Member", "client": False},
+                "bucket": {"id": 10},
+            }
+            client = SimpleNamespace(
+                project_ids=("10",),
+                expected=SimpleNamespace(account_id="1", person_id="7"),
+                attest_full_member=AsyncMock(),
+                fetch_recording=AsyncMock(return_value=canonical),
+                resolve_target=AsyncMock(return_value=("recording", "10")),
+                post_comment=AsyncMock(return_value={"id": 90}),
+                verify_comment_authorship=AsyncMock(
+                    return_value={"id": 90, "creator": {"id": 7}}
+                ),
+                post_chat=AsyncMock(return_value={"id": 91}),
+                verify_chat_authorship=AsyncMock(
+                    return_value={"id": 91, "creator": {"id": 7}}
+                ),
+            )
+            config = PlatformConfig(
+                extra={
+                    "account_id": "1",
+                    "person_id": "7",
+                    "person_email": "agent@example.com",
+                    "mention": "@agent",
+                    "project_ids": ["10"],
+                    "access_token": "test",
+                }
+            )
+            with (
+                patch("adapter._make_client", return_value=client),
+                patch("adapter.default_replay_path", return_value=root / "replay.json"),
+                patch("adapter.configured_media_roots", return_value=(root,)),
+                patch("adapter.configured_inbound_media_root", return_value=root),
+                patch("adapter.Platform", return_value=next(iter(Platform))),
+            ):
+                adapter = BasecampAdapter(config)
+            adapter._bootstrapped = True
+            adapter._poller.collect = AsyncMock(
+                return_value=[
+                    {
+                        "id": 81,
+                        "kind": "comment_created",
+                        "created_at": "2026-09-04T01:00:00Z",
+                        "creator": canonical["creator"],
+                        "bucket": canonical["bucket"],
+                        "recording": canonical,
+                        "parent": {"id": 49, "type": "Todo"},
+                    }
+                ]
+            )
+
+            async def reply(event):
+                await adapter.send(event.source.chat_id, "FOLLOWUP_DONE")
+                await adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
+
+            adapter.handle_message = AsyncMock(side_effect=reply)
+
+            await adapter._poll_once()
+
+            adapter.handle_message.assert_awaited_once()
+            client.resolve_target.assert_awaited_once_with("49", "10")
+            client.post_comment.assert_awaited_once_with("10", "49", "<div>FOLLOWUP_DONE</div>")
+            client.post_chat.assert_not_awaited()
+            self.assertEqual(adapter._inbox.stats()["depth"], 0)
+
     async def test_native_media_send_uses_attachment_markup_and_verified_target(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

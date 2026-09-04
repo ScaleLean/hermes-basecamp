@@ -461,12 +461,17 @@ class BasecampAdapter(BasePlatformAdapter):
                 ):
                     await self._commit_pointer(pointer)
                     continue
-                parent = verified.raw.get("parent") or {}
-                if isinstance(parent, Mapping) and str(parent.get("id") or ""):
-                    self._chat_transcripts[verified.chat_id] = str(parent["id"])
                 verified_recording = verified.raw.get("recording") or {}
                 if isinstance(verified_recording, Mapping):
-                    self._target_types[verified.chat_id] = str(verified_recording.get("type") or "")
+                    recording_type = str(verified_recording.get("type") or "")
+                    self._target_types[verified.chat_id] = recording_type
+                    parent = verified.raw.get("parent") or {}
+                    if (
+                        recording_type in {"Chat::Line", "Chat::Transcript"}
+                        and isinstance(parent, Mapping)
+                        and str(parent.get("id") or "")
+                    ):
+                        self._chat_transcripts[verified.chat_id] = str(parent["id"])
                 is_assignment = verified.kind == "assignment_created"
                 if await asyncio.to_thread(self._deliveries.has_any, verified.event_id):
                     final_delivery = await self._resume_deliveries(verified)
