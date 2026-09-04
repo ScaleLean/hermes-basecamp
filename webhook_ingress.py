@@ -16,6 +16,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+try:
+    from .inbox import DurableInbox
+except ImportError:  # pragma: no cover
+    from inbox import DurableInbox
+
 
 class WebhookRejectedError(PermissionError):
     pass
@@ -163,6 +168,7 @@ class WebhookIngress:
         token: str,
         max_queue: int = 500,
         store: DurableWebhookStore | None = None,
+        inbox: DurableInbox | None = None,
     ) -> None:
         if len(token) < 32:
             raise ValueError("Basecamp webhook token must contain at least 32 characters")
@@ -173,7 +179,10 @@ class WebhookIngress:
         self._seen_order: deque[str] = deque()
         self._max_seen = max(500, max_queue * 10)
         self.store = store
-        if self.store:
+        self.inbox = inbox
+        if self.inbox:
+            self.inbox.recover()
+        elif self.store:
             self.store.recover()
 
     async def ingest(self, token: str, payload: Mapping[str, Any]) -> bool:
@@ -191,7 +200,10 @@ class WebhookIngress:
         project_id = str(bucket.get("id") or "") if isinstance(bucket, Mapping) else ""
         if project_id not in self.client.project_ids:
             raise WebhookRejectedError("Basecamp webhook event is outside the allowlist")
-        if self.store:
+        if self.inbox:
+            if not self.inbox.accept_batch("webhook", f"webhook:{project_id}", [trusted]):
+                return False
+        elif self.store:
             if not self.store.put(event_id, trusted):
                 return False
         else:
@@ -206,6 +218,12 @@ class WebhookIngress:
         return True
 
     async def get(self) -> Mapping[str, Any]:
+        if self.inbox:
+            while True:
+                item = await asyncio.to_thread(self.inbox.claim)
+                if item is not None:
+                    return item.payload
+                await asyncio.sleep(0.05)
         if self.store:
             while True:
                 item = await self._claim_one()
@@ -217,6 +235,9 @@ class WebhookIngress:
 
     async def drain_nowait(self) -> list[Mapping[str, Any]]:
         """Lease at most one item so cancellation cannot strand a whole batch."""
+        if self.inbox:
+            item = await asyncio.to_thread(self.inbox.claim)
+            return [] if item is None else [item.payload]
         if self.store:
             item = await self._claim_one()
             if item is None:
@@ -243,14 +264,20 @@ class WebhookIngress:
             raise
 
     def recover(self) -> None:
+        if self.inbox:
+            self.inbox.recover()
         if self.store:
             self.store.recover()
 
     def ack(self, payload: Mapping[str, Any]) -> None:
+        if self.inbox and payload.get("_inbox_event_key"):
+            self.inbox.complete(payload)
         if self.store and payload.get("_durable_event_id"):
             self.store.ack(str(payload["_durable_event_id"]))
 
     def retry(self, payload: Mapping[str, Any]) -> None:
+        if self.inbox and payload.get("_inbox_event_key"):
+            self.inbox.retry(payload)
         if self.store and payload.get("_durable_event_id"):
             self.store.retry(str(payload["_durable_event_id"]))
 

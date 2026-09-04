@@ -14,8 +14,10 @@ from typing import Any, Protocol
 
 try:
     from .health import RuntimeHealth
+    from .inbox import DurableInbox
 except ImportError:  # pragma: no cover
     from health import RuntimeHealth
+    from inbox import DurableInbox
 
 
 class CursorStore:
@@ -123,6 +125,8 @@ class PollClient(Protocol):
 
     async def notifications(self) -> list[Mapping[str, Any]]: ...
 
+    async def assignments(self) -> list[Mapping[str, Any]]: ...
+
     async def timeline(self, *, limit_per_project: int | None = None) -> list[Mapping[str, Any]]: ...
 
 
@@ -137,21 +141,26 @@ class CompositePoller:
         *,
         chat_seconds: int = 15,
         notification_seconds: int = 45,
+        assignment_seconds: int = 30,
         reconciliation_seconds: int = 300,
         clock: Callable[[], float] = time.monotonic,
         health: RuntimeHealth | None = None,
         cursors: CursorStore | None = None,
+        inbox: DurableInbox | None = None,
     ) -> None:
         self.client = client
         self.chat_seconds = max(10, chat_seconds)
         self.notification_seconds = max(15, notification_seconds)
+        self.assignment_seconds = max(15, assignment_seconds)
         self.reconciliation_seconds = max(60, reconciliation_seconds)
         self.clock = clock
         self.health = health or RuntimeHealth()
         self.cursors = cursors or CursorStore()
+        self.inbox = inbox
         self._campfires: dict[str, str] = {}
         self._next_chat = 0.0
         self._next_notification = 0.0
+        self._next_assignment = 0.0
         self._next_reconciliation = 0.0
         self._lane_successes: set[str] = set()
         self._lane_failures: set[str] = set()
@@ -163,6 +172,7 @@ class CompositePoller:
         do_reconciliation = now >= self._next_reconciliation
         do_chat = now >= self._next_chat
         do_notifications = now >= self._next_notification
+        do_assignments = now >= self._next_assignment
 
         if do_reconciliation or (do_chat and not self._campfires):
             await self._isolated("campfire_discovery", self._refresh_campfires())
@@ -171,10 +181,13 @@ class CompositePoller:
         if do_chat:
             tasks.append(("chat", self._collect_chat()))
             self._next_chat = now + self.chat_seconds
-        if do_notifications:
+        if do_notifications and hasattr(self.client, "notifications"):
             tasks.append(("notifications", self.client.notifications()))
             self._next_notification = now + self.notification_seconds
-        if do_reconciliation:
+        if do_assignments and hasattr(self.client, "assignments"):
+            tasks.append(("assignments", self.client.assignments()))
+            self._next_assignment = now + self.assignment_seconds
+        if do_reconciliation and hasattr(self.client, "timeline"):
             tasks.append(("reconciliation", self.client.timeline(limit_per_project=self.MAX_ITEMS_PER_LANE)))
             self._next_reconciliation = now + self.reconciliation_seconds
 
@@ -184,12 +197,21 @@ class CompositePoller:
             raise RuntimeError("All due Basecamp polling lanes failed")
         unique: dict[str, Mapping[str, Any]] = {}
         for (lane, _), batch in zip(tasks, batches, strict=True):
-            batch = self.cursors.after(lane, batch)
-            self.cursors.update(lane, batch)
+            streams: dict[str, list[Mapping[str, Any]]] = {}
             for event in batch:
-                event_id = str(event.get("id") or "")
-                if event_id:
-                    unique[event_id] = event
+                stream_id = str(event.get("_stream_id") or lane)
+                streams.setdefault(stream_id, []).append(event)
+            for stream_id, stream_batch in streams.items():
+                if self.inbox is not None:
+                    fresh = self.inbox.after_cursor(stream_id, stream_batch)
+                    self.inbox.accept_batch("poll", stream_id, fresh)
+                else:
+                    fresh = self.cursors.after(stream_id, stream_batch)
+                    self.cursors.update(stream_id, fresh)
+                    for event in fresh:
+                        event_id = str(event.get("id") or "")
+                        if event_id:
+                            unique[event_id] = event
         return sorted(unique.values(), key=lambda item: str(item.get("created_at") or ""), reverse=True)
 
     async def _isolated(self, lane: str, awaitable: Any) -> Any:
@@ -210,7 +232,7 @@ class CompositePoller:
             return [] if lane != "campfire_discovery" else None
         circuit.success()
         self._lane_successes.add(lane)
-        self.health.last_success_at = time.time()
+        self.health.lane_succeeded(lane)
         self.health.mark(f"{lane}_successes")
         return result
 

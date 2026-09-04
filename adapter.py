@@ -24,6 +24,7 @@ from gateway.platforms.base import (
 try:
     from .event_model import is_addressed_to, normalize_event, parse_target
     from .formatter import format_chunks
+    from .inbox import DurableInbox
     from .media import MediaManager, configured_inbound_media_root, configured_media_roots, find_attachments
     from .oauth_store import OAuthTokenStore, ResourceOAuthTokenProvider
     from .poller import CompositePoller, CursorStore
@@ -36,10 +37,11 @@ try:
         IdentityMismatchError,
         OAuthCredentials,
     )
-    from .webhook_ingress import DurableWebhookStore, WebhookHTTPReceiver, WebhookIngress
+    from .webhook_ingress import WebhookHTTPReceiver, WebhookIngress
 except ImportError:  # pragma: no cover - installed flat-module wheel
     from event_model import is_addressed_to, normalize_event, parse_target
     from formatter import format_chunks
+    from inbox import DurableInbox
     from media import MediaManager, configured_inbound_media_root, configured_media_roots, find_attachments
     from oauth_store import OAuthTokenStore, ResourceOAuthTokenProvider
     from poller import CompositePoller, CursorStore
@@ -52,7 +54,7 @@ except ImportError:  # pragma: no cover - installed flat-module wheel
         IdentityMismatchError,
         OAuthCredentials,
     )
-    from webhook_ingress import DurableWebhookStore, WebhookHTTPReceiver, WebhookIngress
+    from webhook_ingress import WebhookHTTPReceiver, WebhookIngress
 
 logger = logging.getLogger(__name__)
 MAX_MESSAGE_LENGTH = 50_000
@@ -97,6 +99,7 @@ def _settings(config: PlatformConfig | None = None) -> dict[str, Any]:
         "expires_at": expires,
         "chat_poll_seconds": int(configured("chat_poll_seconds", "BASECAMP_POLL_CHAT_SECONDS", "15")),
         "notification_poll_seconds": int(configured("notification_poll_seconds", "BASECAMP_POLL_NOTIFY_SECONDS", "45")),
+        "assignment_poll_seconds": int(configured("assignment_poll_seconds", "BASECAMP_POLL_ASSIGNMENT_SECONDS", "30")),
         "reconciliation_seconds": int(configured("reconciliation_seconds", "BASECAMP_RECONCILE_SECONDS", "300")),
         "webhook_token": str(configured("webhook_token", "BASECAMP_WEBHOOK_TOKEN")),
         "webhook_host": str(configured("webhook_host", "BASECAMP_WEBHOOK_HOST", "127.0.0.1")),
@@ -182,19 +185,28 @@ class BasecampAdapter(BasePlatformAdapter):
         self._media_roots = configured_media_roots()
         self._inbound_media_root = configured_inbound_media_root(values["account_id"], values["person_id"])
         self._processing_waiters: dict[str, asyncio.Future[ProcessingOutcome]] = {}
+        self._chat_transcripts: dict[str, str] = {}
+        self._target_types: dict[str, str] = {}
         self._poll_seconds = 10
         self._poll_task: asyncio.Task | None = None
         self._replay = ReplayStore(default_replay_path(values["account_id"], values["person_id"]))
+        self._inbox = DurableInbox(
+            default_replay_path(values["account_id"], values["person_id"]).with_name(
+                f"{values['account_id']}-{values['person_id']}-inbox.sqlite3"
+            )
+        )
         self._poller = CompositePoller(
             self._client,
             chat_seconds=values["chat_poll_seconds"],
             notification_seconds=values["notification_poll_seconds"],
+            assignment_seconds=values["assignment_poll_seconds"],
             reconciliation_seconds=values["reconciliation_seconds"],
             cursors=CursorStore(
                 default_replay_path(values["account_id"], values["person_id"]).with_name(
                     f"{values['account_id']}-{values['person_id']}-cursors.json"
                 )
             ),
+            inbox=self._inbox,
         )
         self._health = self._poller.health
         self._runtime_key = (values["account_id"], values["person_id"])
@@ -202,13 +214,10 @@ class BasecampAdapter(BasePlatformAdapter):
         self._webhooks: WebhookIngress | None = None
         self._webhook_server: WebhookHTTPReceiver | None = None
         if values["webhook_token"]:
-            webhook_path = default_replay_path(values["account_id"], values["person_id"]).with_name(
-                f"{values['account_id']}-{values['person_id']}-webhooks.sqlite3"
-            )
             self._webhooks = WebhookIngress(
                 self._client,
                 token=values["webhook_token"],
-                store=DurableWebhookStore(webhook_path),
+                inbox=self._inbox,
             )
             if values["webhook_port"] > 0:
                 self._webhook_server = WebhookHTTPReceiver(
@@ -218,16 +227,18 @@ class BasecampAdapter(BasePlatformAdapter):
                     port=values["webhook_port"],
                     tls_proxy=values["webhook_tls_proxy"],
                 )
-        self._bootstrapped = False
+        self._bootstrapped = self._inbox.is_bootstrapped()
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
+        self._health.transition("starting")
         try:
             await self._client.attest_full_member()
             await asyncio.to_thread(self._replay.load)
+            await asyncio.to_thread(self._inbox.recover)
             if self._webhooks:
                 await asyncio.to_thread(self._webhooks.recover)
         except IdentityMismatchError as exc:
-            self._health.connected = False
+            self._health.transition("blocked")
             self._health.identity_ok = False
             self._health.role_ok = False
             logger.error("[%s] Identity check failed: %s", self.name, exc)
@@ -235,7 +246,7 @@ class BasecampAdapter(BasePlatformAdapter):
             await self._client.close()
             return False
         except Exception as exc:
-            self._health.connected = False
+            self._health.transition("blocked")
             status = getattr(exc, "status_code", None) or getattr(exc, "status", None)
             code = "basecamp_auth_unavailable" if status in {401, 403} else "basecamp_service_unavailable"
             logger.warning("[%s] Basecamp connection check failed: %s", self.name, exc)
@@ -248,18 +259,25 @@ class BasecampAdapter(BasePlatformAdapter):
                 await self._client.close()
                 self._set_fatal_error("basecamp_webhook_bind_failed", str(exc), retryable=False)
                 return False
-        self._poll_task = asyncio.create_task(self._poll_loop())
         self._health.identity_ok = True
         self._health.role_ok = True
         self._health.revoked = False
-        self._health.connected = True
+        self._health.webhook_registration = "receiver_ready" if self._webhook_server else "unconfigured"
+        try:
+            await self._poll_once()
+        except Exception as exc:
+            logger.warning("[%s] Initial receive probe failed: %s", self.name, exc)
+            self._health.transition("recovering")
+        else:
+            self._health.transition("ready" if self._webhook_server else "recovering")
         self._mark_connected()
+        self._poll_task = asyncio.create_task(self._poll_loop())
         self._wire_plugin_handlers(None)
         return True
 
     async def disconnect(self) -> None:
         self._running = False
-        self._health.connected = False
+        self._health.transition("stopped")
         self._mark_disconnected()
         try:
             if self._poll_task:
@@ -283,14 +301,14 @@ class BasecampAdapter(BasePlatformAdapter):
         while self._running:
             try:
                 await self._poll_once()
-                self._health.connected = True
+                self._transition("ready" if getattr(self, "_webhook_server", None) else "recovering")
                 delay = float(self._poll_seconds)
             except asyncio.CancelledError:
                 return
             except Exception as exc:
                 logger.warning("[%s] Timeline poll failed: %s", self.name, exc)
                 self._health.mark("poll_loop_failures")
-                self._health.connected = False
+                self._transition("recovering")
                 if self._poller.health.revoked:
                     self._health.connected = False
                     self._set_fatal_error("basecamp_oauth_revoked", str(exc), retryable=False)
@@ -300,34 +318,60 @@ class BasecampAdapter(BasePlatformAdapter):
 
     def health_snapshot(self) -> dict[str, Any]:
         """Return safe operator health without credentials or message content."""
+        self._health.inbox = self._inbox.stats()
         return self._health.snapshot()
 
+    def _transition(self, state: str) -> None:
+        if hasattr(self._health, "transition"):
+            self._health.transition(state)
+        else:  # Compatibility for narrow host/test health doubles.
+            self._health.connected = state in {"ready", "recovering"}
+
     async def _poll_once(self) -> None:
-        events = await self._poller.collect()
+        polled = await self._poller.collect()
+        if polled:
+            await asyncio.to_thread(self._inbox.accept_batch, "poll", "compatibility", polled)
         if self._poller.health.revoked:
             raise BasecampRuntimeError("Basecamp OAuth grant was revoked")
-        if self._webhooks:
-            events.extend(await self._webhooks.drain_nowait())
+        events: list[Mapping[str, Any]] = []
+        if self._webhooks and self._webhooks.inbox is not self._inbox:
+            for webhook_event in await self._webhooks.drain_nowait():
+                await asyncio.to_thread(
+                    self._inbox.accept_batch, "webhook", "webhook:compatibility", [webhook_event]
+                )
+        while len(events) < 100:
+            claimed = await asyncio.to_thread(self._inbox.claim)
+            if claimed is None:
+                break
+            events.append(claimed.payload)
         pointers = []
         for raw in events:
             pointer = normalize_event(raw)
             if pointer is None:
-                if self._webhooks and raw.get("_durable_event_id"):
+                await asyncio.to_thread(self._inbox.complete, raw)
+                if self._webhooks:
                     self._webhooks.ack(raw)
                 continue
             pointers.append(pointer)
         if not self._bootstrapped:
-            polling_ids = [item.event_id for item in pointers if not item.raw.get("_durable_event_id")]
+            polling_ids = [item.event_id for item in pointers]
             await asyncio.to_thread(self._replay.bootstrap, polling_ids)
             self._bootstrapped = True
-            pointers = [item for item in pointers if item.raw.get("_durable_event_id")]
+            for item in pointers:
+                await asyncio.to_thread(self._inbox.complete, item.raw)
+            await asyncio.to_thread(self._inbox.mark_bootstrapped)
+            pointers = []
         for pointer in reversed(pointers):
-            if pointer.project_id not in self._client.project_ids:
+            bucket = pointer.raw.get("bucket") or {}
+            is_ping = isinstance(bucket, Mapping) and str(bucket.get("type") or "") == "Circle"
+            if not is_ping and pointer.project_id not in self._client.project_ids:
                 logger.warning("[%s] Rejected event from denied project %s", self.name, pointer.project_id)
+                await asyncio.to_thread(self._inbox.complete, pointer.raw)
                 if self._webhooks:
                     self._webhooks.ack(pointer.raw)
                 continue
             if not await asyncio.to_thread(self._replay.claim, pointer.event_id):
+                await asyncio.to_thread(self._inbox.complete, pointer.raw)
                 if self._webhooks:
                     self._webhooks.ack(pointer.raw)
                 continue
@@ -344,17 +388,27 @@ class BasecampAdapter(BasePlatformAdapter):
                 verified = normalize_event(verified_raw)
                 if (
                     not verified
-                    or verified.project_id not in self._client.project_ids
-                    or not is_addressed_to(
-                        verified_raw, person_id=self._client.expected.person_id, mention=self._mention
+                    or (not is_ping and verified.project_id not in self._client.project_ids)
+                    or not (
+                        is_addressed_to(verified_raw, person_id=self._client.expected.person_id, mention=self._mention)
+                        or await asyncio.to_thread(
+                            self._inbox.is_active, verified.project_id, verified.recording_id
+                        )
                     )
                 ):
                     await self._commit_pointer(pointer)
                     continue
+                parent = verified.raw.get("parent") or {}
+                if isinstance(parent, Mapping) and str(parent.get("id") or ""):
+                    self._chat_transcripts[verified.chat_id] = str(parent["id"])
+                verified_recording = verified.raw.get("recording") or {}
+                if isinstance(verified_recording, Mapping):
+                    self._target_types[verified.chat_id] = str(verified_recording.get("type") or "")
+                participants = verified.raw.get("participants") or []
                 source = self.build_source(
                     chat_id=verified.chat_id,
                     chat_name=f"Basecamp {verified.project_id}",
-                    chat_type="group",
+                    chat_type="direct" if is_ping and len(participants) <= 1 else "group",
                     user_id=verified.person_id,
                     user_name=verified.person_name,
                     scope_id=self._client.expected.account_id,
@@ -374,25 +428,50 @@ class BasecampAdapter(BasePlatformAdapter):
                     media_urls=[str(item.path) for item in received_media],
                     media_types=[item.mime_type for item in received_media],
                     media_text_inlined=[False for _ in received_media],
-                    metadata={"basecamp_kind": verified.kind, "project_id": verified.project_id},
+                    metadata={
+                        "basecamp_kind": verified.kind,
+                        "bucket_id": verified.project_id,
+                        "scope_type": "circle" if is_ping else "project",
+                    },
                 )
                 completion = asyncio.get_running_loop().create_future()
                 self._processing_waiters[verified.event_id] = completion
+                is_assignment = verified.kind == "assignment_created"
+                acknowledgement = asyncio.create_task(
+                    self._acknowledge_later(verified, 60.0 if is_assignment else 25.0)
+                ) if is_assignment or is_ping or str((verified.raw.get("recording") or {}).get("type") or "") == "Chat::Line" else None
                 try:
                     await self.handle_message(message_event)
                     outcome = await asyncio.shield(completion)
                 finally:
                     self._processing_waiters.pop(verified.event_id, None)
+                    if acknowledgement:
+                        acknowledgement.cancel()
+                        try:
+                            await acknowledgement
+                        except asyncio.CancelledError:
+                            pass
                 if outcome is not ProcessingOutcome.SUCCESS:
+                    if is_assignment:
+                        await self._post_assignment_status(
+                            verified, "I could not complete this work. The assigned item remains open."
+                        )
+                        await self._commit_pointer(pointer)
+                        continue
                     raise RuntimeError(f"Hermes processing did not complete successfully: {outcome.value}")
+                if is_assignment:
+                    await self._complete_assignment(verified)
+                self._health.last_completed_run_at = __import__("time").time()
                 await self._commit_pointer(pointer)
             except asyncio.CancelledError:
                 await asyncio.to_thread(self._replay.release, pointer.event_id)
+                await asyncio.to_thread(self._inbox.retry, pointer.raw, "cancelled")
                 if self._webhooks:
                     self._webhooks.retry(pointer.raw)
                 raise
-            except Exception:
+            except Exception as exc:
                 await asyncio.to_thread(self._replay.release, pointer.event_id)
+                await asyncio.to_thread(self._inbox.retry, pointer.raw, str(exc))
                 if self._webhooks:
                     self._webhooks.retry(pointer.raw)
                 logger.exception("[%s] Isolated failed Basecamp event %s", self.name, pointer.event_id)
@@ -400,8 +479,44 @@ class BasecampAdapter(BasePlatformAdapter):
 
     async def _commit_pointer(self, pointer: Any) -> None:
         await asyncio.to_thread(self._replay.commit, pointer.event_id)
+        await asyncio.to_thread(self._inbox.complete, pointer.raw)
         if self._webhooks:
             self._webhooks.ack(pointer.raw)
+
+    async def _acknowledge_later(self, pointer: Any, delay: float) -> None:
+        await asyncio.sleep(delay)
+        content = "I received this and am working on it."
+        if pointer.kind == "assignment_created":
+            await self._post_assignment_status(pointer, content)
+        else:
+            result = await self.send(pointer.chat_id, content)
+            if not result.success:
+                raise BasecampRuntimeError(result.error or "Basecamp acknowledgement failed")
+
+    async def _post_assignment_status(self, pointer: Any, content: str) -> None:
+        result = await self._client.post_comment(
+            pointer.project_id, pointer.recording_id, format_chunks(content, max_length=MAX_MESSAGE_LENGTH)[0]
+        )
+        comment_id = str(result.get("id") or "")
+        if not comment_id:
+            raise BasecampRuntimeError("Basecamp assignment status comment lacked an ID")
+        await self._client.verify_comment_authorship(comment_id)
+        await asyncio.to_thread(self._inbox.activate, pointer.project_id, pointer.recording_id)
+
+    async def _complete_assignment(self, pointer: Any) -> None:
+        recording = pointer.raw.get("recording") or {}
+        if not isinstance(recording, Mapping) or str(recording.get("type") or "") != "Todo":
+            return
+        await self._client.call("todos", "complete", {"todo_id": int(pointer.recording_id)})
+        readback = await self._client.call("todos", "get", {"todo_id": int(pointer.recording_id)})
+        bucket = readback.get("bucket") or {} if isinstance(readback, Mapping) else {}
+        if (
+            not isinstance(readback, Mapping)
+            or readback.get("completed") is not True
+            or not isinstance(bucket, Mapping)
+            or str(bucket.get("id") or "") != pointer.project_id
+        ):
+            raise BasecampRuntimeError("Basecamp to-do completion read-back failed")
 
     async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
         """Expose Hermes's reply-completion boundary to durable event ingress."""
@@ -439,6 +554,12 @@ class BasecampAdapter(BasePlatformAdapter):
         try:
             await self._client.attest_full_member()
             target_type, project_id, target_id = parse_target(chat_id)
+            if target_type == "ping":
+                project_id, target_id, target_type = target_id, self._chat_transcripts.get(chat_id, ""), "chat"
+                if not target_id:
+                    raise BasecampRuntimeError("Basecamp Ping transcript is not known from inbound context")
+            elif chat_id in self._chat_transcripts:
+                target_type = "chat"
             manager = MediaManager(self._client, allowed_roots=self._media_roots)
             markup = await manager.upload_markup([file_path], force_document=force_document)
             chunks = format_chunks(caption or "", max_length=MAX_MESSAGE_LENGTH - len(markup)) if caption else [""]
@@ -512,25 +633,41 @@ class BasecampAdapter(BasePlatformAdapter):
         try:
             await self._client.attest_full_member()
             target_type, project_id, target_id = parse_target(chat_id)
-            if project_id not in self._client.project_ids:
+            if target_type == "ping":
+                project_id, target_id, target_type = target_id, self._chat_transcripts.get(chat_id, ""), "chat"
+                if not target_id:
+                    raise BasecampRuntimeError("Basecamp Ping transcript is not known from inbound context")
+            elif chat_id in self._chat_transcripts:
+                target_type = "chat"
+            if target_type != "chat" and project_id not in self._client.project_ids:
                 raise BasecampRuntimeError("Basecamp target project is not allowlisted")
             verified_items: list[dict[str, Any]] = []
             message_id = ""
             for chunk in format_chunks(content, max_length=MAX_MESSAGE_LENGTH):
-                result = (
-                    await self._client.post_chat(project_id, target_id, chunk)
-                    if target_type == "chat"
-                    else await self._client.post_comment(project_id, target_id, chunk)
-                )
+                if self._target_types.get(chat_id) == "Question":
+                    result = await self._client.call(
+                        "checkins", "create_answer", {"question_id": int(target_id), "content": chunk}
+                    )
+                else:
+                    result = (
+                        await self._client.post_chat(project_id, target_id, chunk)
+                        if target_type == "chat"
+                        else await self._client.post_comment(project_id, target_id, chunk)
+                    )
                 message_id = str(result.get("id") or "")
                 if not message_id:
                     raise BasecampRuntimeError("Basecamp write lacked an item ID")
-                verified = (
-                    await self._client.verify_chat_authorship(target_id, message_id)
-                    if target_type == "chat"
-                    else await self._client.verify_comment_authorship(message_id)
-                )
+                if self._target_types.get(chat_id) == "Question":
+                    verified = await self._client.call("checkins", "get_answer", {"answer_id": int(message_id)})
+                    self._client.verify_creator(verified)
+                else:
+                    verified = (
+                        await self._client.verify_chat_authorship(target_id, message_id)
+                        if target_type == "chat"
+                        else await self._client.verify_comment_authorship(message_id)
+                    )
                 verified_items.append(dict(verified))
+            await asyncio.to_thread(self._inbox.activate, project_id, target_id)
             return SendResult(success=True, message_id=message_id, raw_response={"items": verified_items})
         except Exception as exc:
             return SendResult(success=False, error=str(exc))
@@ -540,7 +677,11 @@ class BasecampAdapter(BasePlatformAdapter):
 
     async def get_chat_info(self, chat_id: str) -> dict[str, Any]:
         target_type, project_id, target_id = parse_target(chat_id)
-        return {"name": f"Basecamp {target_type} {target_id}", "type": "group", "project_id": project_id}
+        return {
+            "name": f"Basecamp {target_type} {target_id}",
+            "type": "direct" if target_type == "ping" else "group",
+            "project_id": project_id,
+        }
 
 
 def _env_enablement() -> dict[str, Any] | None:
@@ -564,7 +705,11 @@ def _validate_target_ref(target_ref: str) -> bool | str:
         target_type, project_id, _ = parse_target(target_ref)
     except ValueError as exc:
         return str(exc)
-    if target_type not in {"chat", "recording"} or project_id not in _settings()["project_ids"]:
+    if target_type == "ping":
+        return True
+    if target_type == "bucket":
+        return "A Basecamp bucket is a scope, not a conversation target"
+    if target_type not in {"chat", "recording"} or (project_id and project_id not in _settings()["project_ids"]):
         return "Basecamp target is outside the configured project allowlist"
     return True
 
@@ -582,6 +727,7 @@ def _apply_yaml_config(_yaml_cfg: dict, basecamp_cfg: dict) -> dict[str, Any] | 
         "token_file": "token_file",
         "poll_chat_seconds": "chat_poll_seconds",
         "poll_notify_seconds": "notification_poll_seconds",
+        "poll_assignment_seconds": "assignment_poll_seconds",
         "reconcile_seconds": "reconciliation_seconds",
         "webhook_host": "webhook_host",
         "webhook_port": "webhook_port",

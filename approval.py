@@ -80,8 +80,26 @@ def pre_tool_call(tool_name: str = "", args: Any = None, **_: Any) -> dict[str, 
     if not tool_name.startswith("basecamp_") or not isinstance(args, Mapping):
         return None
     operation = str(args.get("operation") or "")
-    project_id = str(args.get("project_id") or "")
+    project_id = str(args.get("project_id") or args.get("bucket_id") or "")
     arguments = args.get("arguments")
+    if not operation:
+        try:
+            from .tools import WRITE_TOOLS, _resolve_api_route
+        except ImportError:  # pragma: no cover
+            from tools import WRITE_TOOLS, _resolve_api_route
+        if tool_name in WRITE_TOOLS:
+            operation, allowed = WRITE_TOOLS[tool_name]
+            arguments = {key: args[key] for key in allowed if key in args and args[key] is not None}
+        elif tool_name == "basecamp_api_write":
+            try:
+                operation, project_id, path_arguments, _ = _resolve_api_route(
+                    str(args.get("method") or ""), str(args.get("path") or "")
+                )
+            except PermissionError as exc:
+                return {"action": "block", "message": str(exc)}
+            arguments = {**path_arguments, **dict(args.get("body") or {})}
+        elif tool_name in {"basecamp_read_history", "basecamp_api_read"}:
+            return None
     if not operation or not project_id.isdigit() or not isinstance(arguments, Mapping):
         return {"action": "block", "message": "Invalid Basecamp operation context"}
     try:

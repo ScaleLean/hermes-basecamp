@@ -89,12 +89,16 @@ def normalize_event(raw: Mapping[str, Any]) -> NormalizedEvent | None:
     parent = raw.get("parent") or {}
     parent_id = _identifier(parent) if isinstance(parent, Mapping) else ""
     record_type = str(recording.get("type") or raw.get("recordable_type") or "")
-    if record_type in {"Chat::Line", "Chat::Transcript"}:
+    bucket_type = str(bucket.get("type") or raw.get("bucket_type") or "")
+    if bucket_type == "Circle":
         target_id = parent_id or recording_id
-        chat_id = f"chat:{project_id}:{target_id}"
+        chat_id = f"ping:{project_id}"
+    elif record_type in {"Chat::Line", "Chat::Transcript"}:
+        target_id = parent_id or recording_id
+        chat_id = f"bucket:{project_id}/recording:{target_id}"
     else:
         target_id = parent_id or recording_id
-        chat_id = f"recording:{project_id}:{target_id}"
+        chat_id = f"bucket:{project_id}/recording:{target_id}"
 
     created = raw.get("created_at") or raw.get("createdAt")
     try:
@@ -121,6 +125,19 @@ def is_addressed_to(raw: Mapping[str, Any], *, person_id: str, mention: str) -> 
     recording = raw.get("recording") or raw.get("recordable") or {}
     if not isinstance(recording, Mapping):
         recording = {}
+    bucket = raw.get("bucket") or raw.get("project") or {}
+    creator = raw.get("creator") or raw.get("person") or {}
+    if (
+        isinstance(bucket, Mapping)
+        and str(bucket.get("type") or "") == "Circle"
+        and isinstance(creator, Mapping)
+    ):
+        return creator.get("client") is False
+    notification_section = str(raw.get("_notification_section") or "").lower()
+    if notification_section == "mentions":
+        return True
+    if notification_section == "inbox" and str(recording.get("type") or "") == "Question":
+        return True
     assignees = recording.get("assignees") or raw.get("assignees") or []
     if isinstance(assignees, list):
         for assignee in assignees:
@@ -140,9 +157,22 @@ def is_addressed_to(raw: Mapping[str, Any], *, person_id: str, mention: str) -> 
 
 
 def parse_target(chat_id: str) -> tuple[str, str, str]:
+    if re.fullmatch(r"recording:\d+", chat_id):
+        return "recording", "", chat_id.split(":", 1)[1]
+    if re.fullmatch(r"bucket:\d+", chat_id):
+        return "bucket", chat_id.split(":", 1)[1], ""
+    match = re.fullmatch(r"bucket:(\d+)/recording:(\d+)", chat_id)
+    if match:
+        return "recording", match.group(1), match.group(2)
+    if re.fullmatch(r"ping:\d+", chat_id):
+        return "ping", "", chat_id.split(":", 1)[1]
+    # Alpha targets remain parseable during development but are not advertised.
     parts = chat_id.split(":", 2)
     if len(parts) != 3 or parts[0] not in {"chat", "recording"}:
-        raise ValueError("Basecamp target must be chat:<project_id>:<room_id> or recording:<project_id>:<recording_id>")
+        raise ValueError(
+            "Basecamp target must be recording:<id>, bucket:<id>, "
+            "bucket:<id>/recording:<id>, or ping:<circle_id>"
+        )
     if not parts[1].isdigit() or not parts[2].isdigit():
         raise ValueError("Basecamp project and recording IDs must be numeric")
     return parts[0], parts[1], parts[2]

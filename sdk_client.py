@@ -194,7 +194,11 @@ class BasecampSDKClient:
             result = await self._account.timeline.get_project_timeline(
                 project_id=int(project_id), max_items=limit_per_project
             )
-            events.extend(item for item in result if isinstance(item, Mapping))
+            events.extend(
+                {**item, "_stream_id": f"activity:{project_id}"}
+                for item in result
+                if isinstance(item, Mapping)
+            )
         events.sort(key=lambda item: str(item.get("created_at") or ""), reverse=True)
         return events
 
@@ -236,6 +240,7 @@ class BasecampSDKClient:
                     "bucket": {"id": project_id},
                     "recording": {**line, "type": "Chat::Line"},
                     "parent": {"id": campfire_id},
+                    "_stream_id": f"campfire:{project_id}:{campfire_id}",
                 }
             )
         return events
@@ -246,7 +251,92 @@ class BasecampSDKClient:
         for key in ("unreads", "reads", "bubble_ups", "scheduled_bubble_ups"):
             values = payload.get(key) or []
             if isinstance(values, list):
-                events.extend(item for item in values if isinstance(item, Mapping))
+                for item in values:
+                    if not isinstance(item, Mapping):
+                        continue
+                    location = re.search(
+                        r"/buckets/(?P<bucket>\d+)/recordings/(?P<recording>\d+)/",
+                        str(item.get("subscription_url") or ""),
+                    )
+                    if location is None:
+                        continue
+                    bucket_id = location.group("bucket")
+                    recording_id = location.group("recording")
+                    if str(item.get("section") or "").lower() == "pings":
+                        lines = await self._account.campfires.list_lines(
+                            campfire_id=int(recording_id),
+                            sort="created_at",
+                            direction="desc",
+                            max_items=100,
+                        )
+                        for line in lines:
+                            if not isinstance(line, Mapping):
+                                continue
+                            events.append(
+                                {
+                                    "id": line.get("id"),
+                                    "kind": "ping_line_created",
+                                    "created_at": line.get("created_at"),
+                                    "creator": line.get("creator"),
+                                    "bucket": {"id": bucket_id, "type": "Circle"},
+                                    "recording": {**line, "type": "Chat::Line"},
+                                    "parent": {"id": recording_id, "type": "Chat::Transcript"},
+                                    "participants": item.get("participants") or [],
+                                    "_stream_id": f"ping:{bucket_id}",
+                                }
+                            )
+                        continue
+                    if bucket_id not in self.project_ids:
+                        continue
+                    events.append(
+                        {
+                            "id": item.get("id"),
+                            "kind": f"notification_{item.get('section') or 'inbox'}",
+                            "created_at": item.get("updated_at") or item.get("created_at"),
+                            "creator": item.get("creator"),
+                            "bucket": {"id": bucket_id, "type": "Project"},
+                            "recording": {
+                                "id": recording_id,
+                                "type": item.get("type"),
+                                "title": item.get("title"),
+                                "content": item.get("content_excerpt"),
+                            },
+                            "_stream_id": "notifications",
+                            "_notification_section": item.get("section"),
+                        }
+                    )
+        return events
+
+    async def assignments(self) -> list[Mapping[str, Any]]:
+        """Return active assignments as normalized synthetic activity events."""
+        payload = await self._account.my_assignments.get_my_assignments()
+        values: list[Mapping[str, Any]] = []
+        for key in ("priorities", "non_priorities"):
+            group = payload.get(key) or []
+            if isinstance(group, list):
+                values.extend(item for item in group if isinstance(item, Mapping))
+        events: list[Mapping[str, Any]] = []
+        for item in values:
+            bucket = item.get("bucket") or {}
+            project_id = str(bucket.get("id") or "") if isinstance(bucket, Mapping) else ""
+            if project_id not in self.project_ids:
+                continue
+            recording_id = str(item.get("id") or "")
+            if not recording_id:
+                continue
+            updated_at = item.get("updated_at") or item.get("created_at") or item.get("due_on") or ""
+            events.append(
+                {
+                    "id": f"assignment:{recording_id}:{updated_at}",
+                    "kind": "assignment_created",
+                    "created_at": updated_at,
+                    "creator": item.get("creator") or {"id": "basecamp", "name": "Basecamp"},
+                    "bucket": dict(bucket),
+                    "recording": dict(item),
+                    "assignees": item.get("assignees") or [{"id": self.expected.person_id}],
+                    "_stream_id": "assignments",
+                }
+            )
         return events
 
     async def fetch_recording(self, raw_event: Mapping[str, Any]) -> Mapping[str, Any] | None:
@@ -262,6 +352,21 @@ class BasecampSDKClient:
         expected_project_id = (
             str(bucket.get("id") or raw_event.get("bucket_id") or "") if isinstance(bucket, Mapping) else ""
         )
+        bucket_type = str(bucket.get("type") or "") if isinstance(bucket, Mapping) else ""
+        if bucket_type == "Circle" and record_type == "Chat::Line":
+            parent_id = int(parent.get("id") or 0) if isinstance(parent, Mapping) else 0
+            if not parent_id:
+                return None
+            ping_result = await self._account.campfires.get_line(campfire_id=parent_id, line_id=recording_id)
+            result_bucket = ping_result.get("bucket") or {} if isinstance(ping_result, Mapping) else {}
+            if (
+                not isinstance(ping_result, Mapping)
+                or not isinstance(result_bucket, Mapping)
+                or str(result_bucket.get("id") or "") != expected_project_id
+                or str(result_bucket.get("type") or "") != "Circle"
+            ):
+                raise OwnershipMismatchError("Basecamp Ping line does not belong to the expected Circle")
+            return ping_result
         if expected_project_id not in self.project_ids:
             raise OwnershipMismatchError("Basecamp event project is not allowlisted")
         result: Mapping[str, Any] | None = await self._get_webhook_recording(record_type, recording_id)
@@ -348,10 +453,14 @@ class BasecampSDKClient:
         }
 
     async def post_chat(self, project_id: str, room_id: str, content: str) -> Mapping[str, Any]:
-        if project_id not in self.project_ids:
-            raise OwnershipMismatchError("Basecamp Campfire project is not allowlisted")
         room = await self._account.campfires.get(campfire_id=int(room_id))
-        self._require_owned(room, project_id)
+        bucket = room.get("bucket") or {}
+        actual_id = str(bucket.get("id") or "") if isinstance(bucket, Mapping) else ""
+        bucket_type = str(bucket.get("type") or "") if isinstance(bucket, Mapping) else ""
+        if actual_id != project_id:
+            raise OwnershipMismatchError("Basecamp chat belongs to a different bucket")
+        if bucket_type != "Circle" and project_id not in self.project_ids:
+            raise OwnershipMismatchError("Basecamp Campfire project is not allowlisted")
         return await self._account.campfires.create_line(
             campfire_id=int(room_id), content=content, content_type="text/html"
         )
@@ -384,3 +493,7 @@ class BasecampSDKClient:
                 f"got {creator_id or 'missing'}"
             )
         return item
+
+    def verify_creator(self, item: Mapping[str, Any]) -> Mapping[str, Any]:
+        """Verify that a canonical read-back was authored by this agent member."""
+        return self._verify_creator(item)

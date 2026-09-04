@@ -30,6 +30,43 @@ class _Account:
 
 
 class SDKIdentityTests(unittest.IsolatedAsyncioTestCase):
+    async def test_notifications_expand_ping_to_canonical_circle_lines(self):
+        client = object.__new__(BasecampSDKClient)
+        client.project_ids = ("10",)
+        readings = {
+            "unreads": [{
+                "id": 1, "section": "pings",
+                "subscription_url": "https://3.basecampapi.com/1/buckets/55/recordings/66/subscription.json",
+                "participants": [{"id": 8}],
+            }]
+        }
+        line = {"id": 77, "created_at": "2026-09-04T01:00:00Z", "creator": {"id": 8, "client": False}}
+        campfires = SimpleNamespace(list_lines=AsyncMock(return_value=[line]))
+        client._account = SimpleNamespace(
+            my_notifications=SimpleNamespace(get_my_notifications=AsyncMock(return_value=readings)),
+            campfires=campfires,
+        )
+        events = await client.notifications()
+        self.assertEqual(events[0]["bucket"], {"id": "55", "type": "Circle"})
+        self.assertEqual(events[0]["parent"]["id"], "66")
+        self.assertEqual(events[0]["_stream_id"], "ping:55")
+
+    async def test_assignments_filter_denied_projects_and_name_the_stream(self):
+        client = object.__new__(BasecampSDKClient)
+        client.project_ids = ("10",)
+        client.expected = ExpectedIdentity("1", "7", "agent@example.com")
+        payload = {
+            "priorities": [{"id": 40, "type": "Todo", "updated_at": "2026-09-04T01:00:00Z", "bucket": {"id": 10}}],
+            "non_priorities": [{"id": 41, "type": "Todo", "updated_at": "2026-09-04T01:00:00Z", "bucket": {"id": 99}}],
+        }
+        client._account = SimpleNamespace(
+            my_assignments=SimpleNamespace(get_my_assignments=AsyncMock(return_value=payload))
+        )
+        events = await client.assignments()
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["assignees"], [{"id": "7"}])
+        self.assertEqual(events[0]["_stream_id"], "assignments")
+
     async def test_identity_match(self):
         client = object.__new__(BasecampSDKClient)
         client.expected = ExpectedIdentity("1234567", "123", "agent@example.com")

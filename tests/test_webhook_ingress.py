@@ -6,6 +6,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+from inbox import DurableInbox
 from webhook_ingress import (
     DurableWebhookStore,
     WebhookHTTPReceiver,
@@ -32,6 +33,14 @@ class _Client:
 
 
 class WebhookTests(unittest.IsolatedAsyncioTestCase):
+    async def test_webhook_and_poller_share_one_deduplication_key(self):
+        with tempfile.TemporaryDirectory() as temp:
+            inbox = DurableInbox(Path(temp) / "inbox.sqlite3")
+            ingress = WebhookIngress(_Client(), token="t" * 32, inbox=inbox)
+            self.assertTrue(await ingress.ingest("t" * 32, {"id": 3}))
+            canonical = await _Client().fetch_webhook_event({"id": 3})
+            self.assertEqual(inbox.accept_batch("poll", "activity:10", [canonical]), 0)
+
     async def test_token_canonical_scope_and_duplicate_checks(self):
         ingress = WebhookIngress(_Client(), token="t" * 32)
         with self.assertRaises(WebhookRejectedError):

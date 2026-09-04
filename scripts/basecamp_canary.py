@@ -21,7 +21,7 @@ async def run(target: str, message: str) -> int:
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--target", required=True, help="chat:PROJECT_ID:CAMPFIRE_ID")
+    parser.add_argument("--target", required=True, help="bucket:PROJECT_ID/recording:RECORDING_ID")
     parser.add_argument("--message", required=True)
     parser.add_argument("--yes", action="store_true", help="Confirm this exact live Basecamp write")
     args = parser.parse_args()

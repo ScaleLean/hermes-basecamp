@@ -17,7 +17,7 @@ class EventModelTests(unittest.TestCase):
             }
         )
         self.assertIsNotNone(event)
-        self.assertEqual(event.chat_id, "recording:22:44")
+        self.assertEqual(event.chat_id, "bucket:22/recording:44")
         self.assertIn("Hello", event.text)
 
     def test_normalizes_chat_line_to_chat_target(self):
@@ -31,7 +31,7 @@ class EventModelTests(unittest.TestCase):
                 "parent": {"id": 44},
             }
         )
-        self.assertEqual(event.chat_id, "chat:22:44")
+        self.assertEqual(event.chat_id, "bucket:22/recording:44")
 
     def test_rejects_incomplete_events(self):
         self.assertIsNone(normalize_event({"id": 1}))
@@ -78,3 +78,31 @@ class EventModelTests(unittest.TestCase):
     def test_ambient_activity_is_not_addressed(self):
         raw = {"recording": {"content": "General project update"}}
         self.assertFalse(is_addressed_to(raw, person_id="123", mention="@HermesAgent"))
+
+    def test_ping_from_non_client_member_is_a_direct_trigger(self):
+        raw = {
+            "id": 91,
+            "kind": "ping_line_created",
+            "created_at": "2026-09-04T01:00:00Z",
+            "creator": {"id": 11, "name": "Teammate", "client": False},
+            "bucket": {"id": 55, "type": "Circle"},
+            "recording": {"id": 92, "type": "Chat::Line", "content": "Hello"},
+            "parent": {"id": 93, "type": "Chat::Transcript"},
+        }
+        normalized = normalize_event(raw)
+        self.assertEqual(normalized.chat_id, "ping:55")
+        self.assertTrue(is_addressed_to(raw, person_id="123", mention="@HermesAgent"))
+
+    def test_ping_from_client_is_rejected(self):
+        raw = {
+            "creator": {"id": 11, "client": True},
+            "bucket": {"id": 55, "type": "Circle"},
+            "recording": {"id": 92, "type": "Chat::Line", "content": "Hello"},
+        }
+        self.assertFalse(is_addressed_to(raw, person_id="123", mention="@HermesAgent"))
+
+    def test_official_target_grammar(self):
+        self.assertEqual(parse_target("recording:44"), ("recording", "", "44"))
+        self.assertEqual(parse_target("bucket:22"), ("bucket", "22", ""))
+        self.assertEqual(parse_target("bucket:22/recording:44"), ("recording", "22", "44"))
+        self.assertEqual(parse_target("ping:55"), ("ping", "", "55"))
