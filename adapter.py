@@ -106,6 +106,7 @@ def _settings(config: PlatformConfig | None = None) -> dict[str, Any]:
         "webhook_port": int(configured("webhook_port", "BASECAMP_WEBHOOK_PORT", "0")),
         "webhook_tls_proxy": str(configured("webhook_tls_proxy", "BASECAMP_WEBHOOK_TLS_PROXY", "false")).lower()
         in {"1", "true", "yes", "on"},
+        "webhook_public_url": str(configured("webhook_public_url", "BASECAMP_WEBHOOK_PUBLIC_URL")),
     }
 
 
@@ -215,6 +216,7 @@ class BasecampAdapter(BasePlatformAdapter):
         _RUNTIME_HEALTH[self._runtime_key] = self._health
         self._webhooks: WebhookIngress | None = None
         self._webhook_server: WebhookHTTPReceiver | None = None
+        self._webhook_public_url = values["webhook_public_url"]
         if values["webhook_token"]:
             self._webhooks = WebhookIngress(
                 self._client,
@@ -264,14 +266,14 @@ class BasecampAdapter(BasePlatformAdapter):
         self._health.identity_ok = True
         self._health.role_ok = True
         self._health.revoked = False
-        self._health.webhook_registration = "receiver_ready" if self._webhook_server else "unconfigured"
+        webhook_healthy = await self._verify_webhook_registration()
         try:
             await self._poll_once()
         except Exception as exc:
             logger.warning("[%s] Initial receive probe failed: %s", self.name, exc)
             self._health.transition("recovering")
         else:
-            self._health.transition("ready" if self._webhook_server else "recovering")
+            self._health.transition("ready" if webhook_healthy and self._receive_lanes_ready() else "recovering")
         self._mark_connected()
         self._poll_task = asyncio.create_task(self._poll_loop())
         self._wire_plugin_handlers(None)
@@ -303,7 +305,12 @@ class BasecampAdapter(BasePlatformAdapter):
         while self._running:
             try:
                 await self._poll_once()
-                self._transition("ready" if getattr(self, "_webhook_server", None) else "recovering")
+                self._transition(
+                    "ready"
+                    if getattr(self._health, "webhook_registration", "") == "healthy"
+                    and self._receive_lanes_ready()
+                    else "recovering"
+                )
                 delay = float(self._poll_seconds)
             except asyncio.CancelledError:
                 return
@@ -328,6 +335,33 @@ class BasecampAdapter(BasePlatformAdapter):
             self._health.transition(state)
         else:  # Compatibility for narrow host/test health doubles.
             self._health.connected = state in {"ready", "recovering"}
+
+    def _receive_lanes_ready(self) -> bool:
+        required = {"campfire_discovery", "chat", "notifications", "assignments", "reconciliation"}
+        return required.issubset(getattr(self._health, "lane_last_success", {}))
+
+    async def _verify_webhook_registration(self) -> bool:
+        if not self._webhook_server or not self._webhook_public_url:
+            self._health.webhook_registration = "unconfigured"
+            return False
+        try:
+            try:
+                from .sdk_client import SAFE_WEBHOOK_RECORDING_GETTERS
+                from .webhook_reconciliation import WebhookReconciler
+            except ImportError:  # pragma: no cover
+                from sdk_client import SAFE_WEBHOOK_RECORDING_GETTERS
+                from webhook_reconciliation import WebhookReconciler
+            results = await WebhookReconciler(
+                self._client,
+                payload_url=self._webhook_public_url,
+                event_types=tuple(SAFE_WEBHOOK_RECORDING_GETTERS),
+            ).reconcile(approved=False)
+        except Exception:
+            self._health.webhook_registration = "drifted"
+            return False
+        healthy = bool(results) and all(item.verified for item in results)
+        self._health.webhook_registration = "healthy" if healthy else "drifted"
+        return healthy
 
     async def _poll_once(self) -> None:
         polled = await self._poller.collect()
@@ -760,6 +794,7 @@ def _apply_yaml_config(_yaml_cfg: dict, basecamp_cfg: dict) -> dict[str, Any] | 
         "webhook_host": "webhook_host",
         "webhook_port": "webhook_port",
         "webhook_tls_proxy": "webhook_tls_proxy",
+        "webhook_public_url": "webhook_public_url",
     }
     extras: dict[str, Any] = {}
     for source, destination in aliases.items():
