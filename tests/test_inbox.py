@@ -51,6 +51,15 @@ class DurableInboxTests(unittest.TestCase):
             self.assertEqual(inbox.after_cursor("campfire:10:30", [event(1)]), [])
             self.assertEqual(inbox.after_cursor("campfire:10:31", [event(1)]), [event(1)])
 
+    def test_snapshot_stream_without_timestamps_uses_id_set_cursor(self):
+        with tempfile.TemporaryDirectory() as temp:
+            inbox = DurableInbox(Path(temp) / "inbox.sqlite3")
+            assigned = {"id": "assignment:40", "recording": {"id": 40}}
+            inbox.accept_batch("poll", "assignments", [assigned])
+            self.assertEqual(inbox.after_cursor("assignments", [assigned]), [])
+            new = {"id": "assignment:41", "recording": {"id": 41}}
+            self.assertEqual(inbox.after_cursor("assignments", [assigned, new]), [new])
+
     def test_payload_is_removed_from_terminal_record(self):
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "inbox.sqlite3"

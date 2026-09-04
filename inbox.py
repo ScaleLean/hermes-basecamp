@@ -171,10 +171,12 @@ class DurableInbox:
             row = connection.execute(
                 "SELECT watermark, ids_json FROM inbox_cursors WHERE stream_id = ?", (stream_id,)
             ).fetchone()
-        if row is None or not row["watermark"]:
+        if row is None:
             return list(events)
         seen = set(json.loads(row["ids_json"]))
         watermark = str(row["watermark"])
+        if not watermark:
+            return [item for item in events if str(item.get("id") or "") not in seen]
         return [
             item
             for item in events
@@ -192,6 +194,13 @@ class DurableInbox:
     ) -> None:
         timestamps = [str(item.get("created_at") or "") for item in events if item.get("created_at")]
         if not timestamps:
+            snapshot_ids = sorted(str(item.get("id") or "") for item in events if item.get("id"))
+            connection.execute(
+                """INSERT INTO inbox_cursors(stream_id, watermark, ids_json, updated_at)
+                   VALUES (?, '', ?, ?)
+                   ON CONFLICT(stream_id) DO UPDATE SET ids_json=excluded.ids_json, updated_at=excluded.updated_at""",
+                (stream_id, json.dumps(snapshot_ids), now),
+            )
             return
         incoming = max(timestamps)
         row = connection.execute(
