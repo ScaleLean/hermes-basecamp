@@ -56,17 +56,32 @@ class SDKIdentityTests(unittest.IsolatedAsyncioTestCase):
         client.project_ids = ("10",)
         client.expected = ExpectedIdentity("1", "7", "agent@example.com")
         payload = {
-            "priorities": [{"id": 40, "type": "todo", "updated_at": "2026-09-04T01:00:00Z", "bucket": {"id": 10}}],
+            "priorities": [{"id": 40, "type": "todo", "bucket": {"id": 10}}],
             "non_priorities": [{"id": 41, "type": "Todo", "updated_at": "2026-09-04T01:00:00Z", "bucket": {"id": 99}}],
         }
+        get_todo = AsyncMock(
+            return_value={
+                "id": 40,
+                "type": "Todo",
+                "updated_at": "2026-09-04T02:00:00Z",
+                "creator": {"id": 8, "name": "Member", "client": False},
+                "assignees": [{"id": 7}],
+                "bucket": {"id": 10},
+            }
+        )
         client._account = SimpleNamespace(
-            my_assignments=SimpleNamespace(get_my_assignments=AsyncMock(return_value=payload))
+            my_assignments=SimpleNamespace(get_my_assignments=AsyncMock(return_value=payload)),
+            todos=SimpleNamespace(get=get_todo),
         )
         events = await client.assignments()
         self.assertEqual(len(events), 1)
-        self.assertEqual(events[0]["assignees"], [{"id": "7"}])
+        self.assertEqual(events[0]["assignees"], [{"id": 7}])
+        self.assertEqual(events[0]["creator"]["id"], 8)
+        self.assertEqual(events[0]["created_at"], "2026-09-04T02:00:00Z")
+        self.assertEqual(events[0]["id"], "assignment:40:2026-09-04T02:00:00Z")
         self.assertEqual(events[0]["recording"]["type"], "Todo")
         self.assertEqual(events[0]["_stream_id"], "assignments")
+        get_todo.assert_awaited_once_with(todo_id=40)
 
     async def test_identity_match(self):
         client = object.__new__(BasecampSDKClient)

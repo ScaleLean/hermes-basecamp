@@ -333,15 +333,25 @@ class BasecampSDKClient:
                 "step": "Kanban::Step",
                 "kanban::step": "Kanban::Step",
             }.get(raw_type.lower(), raw_type)
+            canonical = await self._get_webhook_recording(canonical_type, int(recording_id))
+            if canonical is None:
+                continue
+            canonical = self._require_owned(canonical, project_id)
+            updated_at = (
+                canonical.get("updated_at")
+                or canonical.get("created_at")
+                or canonical.get("due_on")
+                or updated_at
+            )
             events.append(
                 {
                     "id": f"assignment:{recording_id}:{updated_at}",
                     "kind": "assignment_created",
                     "created_at": updated_at,
-                    "creator": item.get("creator") or {"id": "basecamp", "name": "Basecamp"},
+                    "creator": canonical.get("creator") or item.get("creator") or {},
                     "bucket": dict(bucket),
-                    "recording": {**item, "type": canonical_type},
-                    "assignees": item.get("assignees") or [{"id": self.expected.person_id}],
+                    "recording": {**canonical, "type": canonical_type},
+                    "assignees": canonical.get("assignees") or item.get("assignees") or [],
                     "_stream_id": "assignments",
                 }
             )
