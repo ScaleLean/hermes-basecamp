@@ -220,6 +220,44 @@ class AdapterRuntimeTests(unittest.IsolatedAsyncioTestCase):
             client.post_chat.assert_awaited_once_with("55", "66", "<div>PING_GREEN</div>")
             self.assertEqual(adapter._inbox.stats()["depth"], 0)
 
+    async def test_ping_send_resolves_transcript_when_runtime_cache_is_empty(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            client = SimpleNamespace(
+                project_ids=("10",),
+                expected=SimpleNamespace(account_id="1", person_id="7"),
+                attest_full_member=AsyncMock(),
+                resolve_ping_transcript=AsyncMock(return_value="66"),
+                post_chat=AsyncMock(return_value={"id": 90}),
+                verify_chat_authorship=AsyncMock(
+                    return_value={"id": 90, "creator": {"id": 7}}
+                ),
+            )
+            config = PlatformConfig(
+                extra={
+                    "account_id": "1",
+                    "person_id": "7",
+                    "person_email": "agent@example.com",
+                    "mention": "@agent",
+                    "project_ids": ["10"],
+                    "access_token": "test",
+                }
+            )
+            with (
+                patch("adapter._make_client", return_value=client),
+                patch("adapter.default_replay_path", return_value=root / "replay.json"),
+                patch("adapter.configured_media_roots", return_value=(root,)),
+                patch("adapter.configured_inbound_media_root", return_value=root),
+                patch("adapter.Platform", return_value=next(iter(Platform))),
+            ):
+                adapter = BasecampAdapter(config)
+
+            result = await adapter.send("ping:55", "PING_GREEN")
+
+            self.assertTrue(result.success)
+            client.resolve_ping_transcript.assert_awaited_once_with("55")
+            client.post_chat.assert_awaited_once_with("55", "66", "<div>PING_GREEN</div>")
+
     async def test_uncertain_reply_reconciles_without_a_second_write(self):
         with tempfile.TemporaryDirectory() as temp:
             adapter = object.__new__(BasecampAdapter)

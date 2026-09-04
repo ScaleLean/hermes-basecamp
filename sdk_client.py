@@ -73,6 +73,9 @@ NOTIFICATION_APP_ROUTES: tuple[tuple[re.Pattern[str], str], ...] = (
 CHAT_LINE_APP_ROUTE = re.compile(
     r"/buckets/(?P<bucket>\d+)/chats/(?P<parent>\d+)@(?P<recording>\d+)(?:$|[/?#])"
 )
+SUBSCRIPTION_RECORDING_ROUTE = re.compile(
+    r"/buckets/(?P<bucket>\d+)/recordings/(?P<recording>\d+)/"
+)
 
 
 def _notification_recording(item: Mapping[str, Any]) -> tuple[str, str, str, str] | None:
@@ -285,6 +288,27 @@ class BasecampSDKClient:
     async def pings(self) -> list[Mapping[str, Any]]:
         return await self._notification_events(pings_only=True)
 
+    async def resolve_ping_transcript(self, circle_id: str) -> str:
+        """Resolve a Circle to its Ping transcript from authenticated notifications."""
+        if not circle_id.isdigit():
+            raise OwnershipMismatchError("Basecamp Ping Circle ID must be numeric")
+        payload = await self._account.my_notifications.get_my_notifications(limit_bubble_ups=True)
+        for key in ("unreads", "reads", "bubble_ups", "scheduled_bubble_ups"):
+            values = payload.get(key) or []
+            if not isinstance(values, list):
+                continue
+            for item in values:
+                if not isinstance(item, Mapping):
+                    continue
+                if str(item.get("section") or "").lower() != "pings":
+                    continue
+                location = SUBSCRIPTION_RECORDING_ROUTE.search(
+                    str(item.get("subscription_url") or "")
+                )
+                if location is not None and location.group("bucket") == circle_id:
+                    return location.group("recording")
+        raise OwnershipMismatchError("Basecamp Ping transcript could not be resolved")
+
     async def _notification_events(self, *, pings_only: bool) -> list[Mapping[str, Any]]:
         payload = await self._account.my_notifications.get_my_notifications(limit_bubble_ups=True)
         events: list[Mapping[str, Any]] = []
@@ -294,9 +318,8 @@ class BasecampSDKClient:
                 for item in values:
                     if not isinstance(item, Mapping):
                         continue
-                    location = re.search(
-                        r"/buckets/(?P<bucket>\d+)/recordings/(?P<recording>\d+)/",
-                        str(item.get("subscription_url") or ""),
+                    location = SUBSCRIPTION_RECORDING_ROUTE.search(
+                        str(item.get("subscription_url") or "")
                     )
                     section = str(item.get("section") or "").lower()
                     if section == "pings":

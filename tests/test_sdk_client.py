@@ -30,6 +30,27 @@ class _Account:
 
 
 class SDKIdentityTests(unittest.IsolatedAsyncioTestCase):
+    async def test_resolve_ping_transcript_from_circle_notification(self):
+        client = object.__new__(BasecampSDKClient)
+        client._account = SimpleNamespace(
+            my_notifications=SimpleNamespace(
+                get_my_notifications=AsyncMock(
+                    return_value={
+                        "unreads": [
+                            {
+                                "section": "pings",
+                                "subscription_url": (
+                                    "https://3.basecampapi.com/1/buckets/55/recordings/66/subscription.json"
+                                ),
+                            }
+                        ]
+                    }
+                )
+            )
+        )
+
+        self.assertEqual(await client.resolve_ping_transcript("55"), "66")
+
     async def test_resolve_target_recognizes_allowlisted_campfire(self):
         client = object.__new__(BasecampSDKClient)
         client.project_ids = ("10",)

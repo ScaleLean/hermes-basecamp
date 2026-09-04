@@ -715,6 +715,21 @@ class BasecampAdapter(BasePlatformAdapter):
             received.append(await manager.receive(attachment, destination))
         return received
 
+    async def _resolve_delivery_target(self, chat_id: str) -> tuple[str, str, str]:
+        target_type, project_id, target_id = parse_target(chat_id)
+        if target_type == "ping":
+            circle_id = target_id
+            transcript_id = self._chat_transcripts.get(chat_id)
+            if not transcript_id:
+                transcript_id = await self._client.resolve_ping_transcript(circle_id)
+                self._chat_transcripts[chat_id] = transcript_id
+            return "chat", circle_id, transcript_id
+        if chat_id in self._chat_transcripts:
+            return "chat", project_id, target_id
+        if target_type == "recording":
+            target_type, project_id = await self._client.resolve_target(target_id, project_id)
+        return target_type, project_id, target_id
+
     async def _send_media_file(
         self,
         chat_id: str,
@@ -727,15 +742,7 @@ class BasecampAdapter(BasePlatformAdapter):
     ) -> SendResult:
         try:
             await self._client.attest_full_member()
-            target_type, project_id, target_id = parse_target(chat_id)
-            if target_type == "ping":
-                project_id, target_id, target_type = target_id, self._chat_transcripts.get(chat_id, ""), "chat"
-                if not target_id:
-                    raise BasecampRuntimeError("Basecamp Ping transcript is not known from inbound context")
-            elif chat_id in self._chat_transcripts:
-                target_type = "chat"
-            elif target_type == "recording":
-                target_type, project_id = await self._client.resolve_target(target_id, project_id)
+            target_type, project_id, target_id = await self._resolve_delivery_target(chat_id)
             manager = MediaManager(self._client, allowed_roots=self._media_roots)
             markup = await manager.upload_markup([file_path], force_document=force_document)
             chunks = format_chunks(caption or "", max_length=MAX_MESSAGE_LENGTH - len(markup)) if caption else [""]
@@ -829,15 +836,7 @@ class BasecampAdapter(BasePlatformAdapter):
     ) -> SendResult:
         try:
             await self._client.attest_full_member()
-            target_type, project_id, target_id = parse_target(chat_id)
-            if target_type == "ping":
-                project_id, target_id, target_type = target_id, self._chat_transcripts.get(chat_id, ""), "chat"
-                if not target_id:
-                    raise BasecampRuntimeError("Basecamp Ping transcript is not known from inbound context")
-            elif chat_id in self._chat_transcripts:
-                target_type = "chat"
-            elif target_type == "recording":
-                target_type, project_id = await self._client.resolve_target(target_id, project_id)
+            target_type, project_id, target_id = await self._resolve_delivery_target(chat_id)
             if target_type != "chat" and project_id not in self._client.project_ids:
                 raise BasecampRuntimeError("Basecamp target project is not allowlisted")
             verified_items: list[dict[str, Any]] = []
